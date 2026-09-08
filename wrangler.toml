@@ -1,0 +1,29 @@
+name = "freedom-helper-bot"
+main = "src/daily-gemini.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
+[triggers]
+crons = ["0 * * * *", "0 11 * * SAT", "0 13 * * THU"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "freedom-helper"
+database_id = "4c98b70f-14f5-4348-863e-380911bdca98"
