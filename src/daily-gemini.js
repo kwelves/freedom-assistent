@@ -15,11 +15,25 @@ export default {
     const update = await request.json().catch(() => null);
     const message = update?.message;
     const command = message?.text?.trim().toLowerCase().split(/\s+/)[0]?.split("@")[0];
-    if (command !== "/daily" || String(message?.from?.id) !== String(env.OWNER_ID)) return workerResponse;
+    const isOwner = String(message?.from?.id) === String(env.OWNER_ID);
 
-    await sendMessage(env, message.chat.id, "⏳ Получил команду. Готовлю ежедневные тексты и перевод.");
-    await sendDailyPreview(env, message.chat.id);
-    return new Response("OK");
+    if (command === "/daily" && isOwner) {
+      await sendMessage(env, message.chat.id, "⏳ Получил команду. Готовлю ежедневные тексты и перевод.");
+      await sendDailyPreview(env, message.chat.id);
+      return new Response("OK");
+    }
+
+    if ((command === "/daily_for_all" || command === "/daily_force_all") && isOwner) {
+      if (!await claimDailyBroadcastCommand(env, command, update?.update_id)) {
+        return new Response("OK");
+      }
+      const force = command === "/daily_force_all";
+      const summary = await runDailyBroadcast(env, { force });
+      await sendMessage(env, env.OWNER_ID, formatBroadcastSummary(command, summary));
+      return new Response("OK");
+    }
+
+    return workerResponse;
   },
 
   scheduled(controller, env, ctx) {
@@ -35,29 +49,127 @@ export async function checkScheduledDaily(env) {
   const today = getBishkekDate();
   if (today.hour < DAILY_START_HOUR) return;
 
-  const subscribers = await getActiveSubscribers(env);
-  if (!subscribers.length) return;
-
   try {
-    const [russianHtml, spiritualHtml] = await Promise.all([
-      fetchPage(RUSSIAN_SOURCE_URL),
-      fetchPage(SPIRITUAL_SOURCE_URL)
-    ]);
-
-    const russianMeditation = parseRussianMeditation(russianHtml);
-    if (isCurrentRussianDate(russianMeditation.date, today)) {
-      const pendingSubscribers = await getPendingSubscribers(env, "russian", today.key, subscribers);
-      if (pendingSubscribers.length) {
-        await sendDailyToSubscribers(env, "russian", today.key, "ЕЖЕДНЕВНИК", russianMeditation, pendingSubscribers);
-      }
-    } else {
-      await sendMessage(env, env.OWNER_ID, "⌛ Дата Ежедневника ещё не изменилась. Проверю снова через час.");
-    }
-
-    await processSpiritualDaily(env, spiritualHtml, today, subscribers);
+    await runDailyBroadcast(env, { force: false, notifyRussianStale: true, today });
   } catch (error) {
     console.error(JSON.stringify({ event: "scheduled_daily_check_failed", error: String(error) }));
   }
+}
+
+export async function runDailyBroadcast(env, { force = false, notifyRussianStale = false, today = getBishkekDate() } = {}) {
+  const subscribers = await getActiveSubscribers(env);
+  const summary = {
+    activeSubscribers: subscribers.length,
+    force,
+    russian: createMaterialSummary(),
+    spiritual: createMaterialSummary(),
+    deactivated: 0
+  };
+  if (!subscribers.length) return summary;
+
+  const deactivatedChatIds = new Set();
+  const [russianPage, spiritualPage] = await Promise.allSettled([
+    fetchPage(RUSSIAN_SOURCE_URL),
+    fetchPage(SPIRITUAL_SOURCE_URL)
+  ]);
+
+  if (russianPage.status === "rejected") {
+    markMaterialError(summary.russian, russianPage.reason);
+  } else {
+    try {
+      const russianMeditation = parseRussianMeditation(russianPage.value);
+      if (!isCurrentRussianDate(russianMeditation.date, today)) {
+        summary.russian.status = "not_updated";
+        if (notifyRussianStale) {
+          await sendMessage(env, env.OWNER_ID, "⌛ Дата Ежедневника ещё не изменилась. Проверю снова через час.");
+        }
+      } else {
+        Object.assign(summary.russian, await sendDailyToSubscribers(
+          env,
+          "russian",
+          today.key,
+          "ЕЖЕДНЕВНИК",
+          russianMeditation,
+          subscribers,
+          { force, deactivatedChatIds }
+        ));
+      }
+    } catch (error) {
+      markMaterialError(summary.russian, error);
+    }
+  }
+
+  if (spiritualPage.status === "rejected") {
+    markMaterialError(summary.spiritual, spiritualPage.reason);
+  } else {
+    try {
+      const spiritualPrinciple = parseSpiritualPrinciple(spiritualPage.value);
+      if (!isCurrentEnglishDate(spiritualPrinciple.date, today)) {
+        summary.spiritual.status = "not_updated";
+      } else {
+        const pendingSubscribers = force
+          ? subscribers.filter((chatId) => !deactivatedChatIds.has(chatId))
+          : await getPendingSubscribers(env, "spiritual", today.key, subscribers, deactivatedChatIds);
+        if (!pendingSubscribers.length) {
+          summary.spiritual.skipped = subscribers.length - deactivatedChatIds.size;
+        } else {
+          const translation = await translateToRussian(env, spiritualPrinciple.raw);
+          Object.assign(summary.spiritual, await sendDailyToSubscribers(
+            env,
+            "spiritual",
+            today.key,
+            "ДУХОВНЫЕ ПРИНЦИПЫ",
+            splitDailyText(translation),
+            subscribers,
+            { force, deactivatedChatIds }
+          ));
+        }
+      }
+    } catch (error) {
+      markMaterialError(summary.spiritual, error);
+    }
+  }
+
+  summary.deactivated = deactivatedChatIds.size;
+  return summary;
+}
+
+function createMaterialSummary() {
+  return { status: "ready", sent: 0, skipped: 0, errors: 0 };
+}
+
+function markMaterialError(material, error) {
+  material.status = "error";
+  material.errors += 1;
+  material.error = String(error).slice(0, 300);
+}
+
+async function claimDailyBroadcastCommand(env, command, updateId) {
+  if (!Number.isInteger(updateId)) return false;
+  const marker = `command:${command.slice(1)}:${updateId}`;
+  const result = await env.DB.prepare(
+    "INSERT OR IGNORE INTO sent_reminders (reminder_key) VALUES (?)"
+  ).bind(marker).run();
+  return result.meta.changes === 1;
+}
+
+export function formatBroadcastSummary(command, summary) {
+  const materialLines = (title, material) => {
+    const status = material.status === "not_updated"
+      ? "\nstatus: ещё не обновлён"
+      : material.status === "error"
+        ? "\nstatus: ошибка источника/обработки"
+        : "";
+    return `${title}:${status}\nsent: ${material.sent}\nskipped: ${material.skipped}\nerrors: ${material.errors}`;
+  };
+  return [
+    `✅ ${command} завершена`,
+    `Active subscribers: ${summary.activeSubscribers}`,
+    ...(summary.force ? ["Mode: FORCE"] : []),
+    materialLines("Ежедневник", summary.russian),
+    materialLines("Духовные принципы", summary.spiritual),
+    `deactivated: ${summary.deactivated}`
+  ].join("\n\n");
 }
 
 export async function processSpiritualDaily(env, html, today, subscribers) {
@@ -127,9 +239,10 @@ async function wasSent(env, key) {
   return Boolean(await env.DB.prepare("SELECT 1 FROM sent_reminders WHERE reminder_key = ?").bind(key).first());
 }
 
-async function getPendingSubscribers(env, contentType, dateKey, subscribers) {
+async function getPendingSubscribers(env, contentType, dateKey, subscribers, deactivatedChatIds = new Set()) {
   const pending = [];
   for (const chatId of subscribers) {
+    if (deactivatedChatIds.has(chatId)) continue;
     if (!await wasSent(env, `daily:${contentType}:${dateKey}:${chatId}`)) pending.push(chatId);
   }
   return pending;
@@ -147,16 +260,40 @@ async function sendDailyOnce(env, key, send) {
   }
 }
 
-export async function sendDailyToSubscribers(env, contentType, dateKey, heading, content, subscribers) {
+export async function sendDailyToSubscribers(
+  env,
+  contentType,
+  dateKey,
+  heading,
+  content,
+  subscribers,
+  { force = false, deactivatedChatIds = new Set() } = {}
+) {
+  const stats = { sent: 0, skipped: 0, errors: 0 };
   for (const chatId of subscribers) {
+    if (deactivatedChatIds.has(chatId)) {
+      stats.skipped += 1;
+      continue;
+    }
     const marker = `daily:${contentType}:${dateKey}:${chatId}`;
-    if (await wasSent(env, marker)) continue;
+    if (!force && await wasSent(env, marker)) {
+      stats.skipped += 1;
+      continue;
+    }
 
     try {
-      await sendDailyOnce(env, marker, () => sendDailyPost(env, chatId, heading, content));
+      if (force) {
+        await sendDailyPost(env, chatId, heading, content);
+        await env.DB.prepare("INSERT OR IGNORE INTO sent_reminders (reminder_key) VALUES (?)").bind(marker).run();
+      } else {
+        await sendDailyOnce(env, marker, () => sendDailyPost(env, chatId, heading, content));
+      }
+      stats.sent += 1;
     } catch (error) {
+      stats.errors += 1;
       console.error(JSON.stringify({ event: "daily_recipient_failed", chat_id: chatId, error: String(error) }));
       if (isInactiveRecipientError(error)) {
+        deactivatedChatIds.add(chatId);
         try {
           await env.DB.prepare("UPDATE subscribers SET active = 0 WHERE chat_id = ?").bind(chatId).run();
         } catch (deactivationError) {
@@ -165,6 +302,7 @@ export async function sendDailyToSubscribers(env, contentType, dateKey, heading,
       }
     }
   }
+  return stats;
 }
 
 function isInactiveRecipientError(error) {

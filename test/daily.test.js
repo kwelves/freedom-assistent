@@ -4,10 +4,13 @@ import test from "node:test";
 
 import { handleUpdate } from "../src/index.js";
 import dailyWorker, {
+  formatBroadcastSummary,
+  getBishkekDate,
   HOURLY_CRON,
   isCurrentEnglishDate,
   parseSpiritualPrinciple,
   processSpiritualDaily,
+  runDailyBroadcast,
   sendDailyToSubscribers
 } from "../src/daily-gemini.js";
 import { currentSpadnaFixture, FakeDB, telegramFetch } from "./helpers.js";
@@ -19,6 +22,82 @@ const russianPreviewFixture = `
 <div class="text-md text-secondary-blue">Источник</div>
 <div class="text-md mt-8"><p>Основной текст</p></div>
 <div class="order-2"></div>`;
+
+function installTimingSafeEqual(t) {
+  const original = crypto.subtle.timingSafeEqual;
+  Object.defineProperty(crypto.subtle, "timingSafeEqual", {
+    configurable: true,
+    value(left, right) {
+      const a = new Uint8Array(left);
+      const b = new Uint8Array(right);
+      if (a.length !== b.length) return false;
+      let difference = 0;
+      for (let index = 0; index < a.length; index += 1) difference |= a[index] ^ b[index];
+      return difference === 0;
+    }
+  });
+  t.after(() => {
+    if (original) Object.defineProperty(crypto.subtle, "timingSafeEqual", { configurable: true, value: original });
+    else delete crypto.subtle.timingSafeEqual;
+  });
+}
+
+function webhookRequest(command, fromId = 77, updateId = 1000) {
+  return new Request("https://worker.example/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "hook-secret"
+    },
+    body: JSON.stringify({ update_id: updateId, message: {
+      message_id: 12,
+      text: command,
+      chat: { id: fromId, type: "private" },
+      from: { id: fromId, username: "user", first_name: "User" }
+    } })
+  });
+}
+
+function dailySourcesFetch(telegramMessages, failures = new Map()) {
+  return async (url, options = {}) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/") return new Response(russianPreviewFixture);
+    if (target === "https://www.spadna.org/") return new Response(currentSpadnaFixture);
+    if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
+      return new Response(JSON.stringify({
+        steps: [{ type: "model_output", content: [{ type: "text", text: "8 сентября 2026\nПереведённая тема\nПереведённый текст" }] }]
+      }), { headers: { "content-type": "application/json" } });
+    }
+    if (target.startsWith("https://api.telegram.org/bot")) {
+      const body = JSON.parse(options.body);
+      telegramMessages.push(body);
+      const failure = failures.get(body.chat_id);
+      if (failure) {
+        return new Response(JSON.stringify({ ok: false, description: failure }), {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: telegramMessages.length } }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch: ${target}`);
+  };
+}
+
+function countedDailySourcesFetch(telegramMessages, sourceCalls) {
+  const baseFetch = dailySourcesFetch(telegramMessages);
+  return (url, options) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/" || target === "https://www.spadna.org/") {
+      sourceCalls.count += 1;
+    }
+    return baseFetch(url, options);
+  };
+}
+
+const broadcastToday = { key: "2026-09-08", year: 2026, month: 9, day: 8, hour: 10 };
 
 test("spadna parser extracts all required fields", () => {
   const parsed = parseSpiritualPrinciple(currentSpadnaFixture);
@@ -128,26 +207,231 @@ test("stale Spiritual date sends no Telegram message", async (t) => {
   assert.deepEqual(sent, []);
 });
 
+for (const command of ["/daily_for_all", "/daily_force_all"]) {
+  test(`${command} is unavailable to non-owner`, async (t) => {
+    installTimingSafeEqual(t);
+    const db = new FakeDB();
+    const sent = [];
+    t.mock.method(globalThis, "fetch", telegramFetch(sent));
+    const response = await dailyWorker.fetch(webhookRequest(command, 88), {
+      DB: db,
+      BOT_TOKEN: "test",
+      OWNER_ID: "77",
+      TELEGRAM_WEBHOOK_SECRET: "hook-secret",
+      GEMINI_API_KEY: "unused"
+    }, { waitUntil() { throw new Error("waitUntil must not be used"); } });
+    assert.equal(response.status, 200);
+    assert.deepEqual(sent, []);
+    assert.equal(db.markers.size, 0);
+  });
+}
+
+test("normal broadcast sends pending recipients, skips existing markers and creates new markers", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  db.subscribers.set(2, { chat_id: 2, active: 1 });
+  db.markers.add("daily:russian:2026-09-08:2");
+  db.markers.add("daily:spiritual:2026-09-08:2");
+  const sent = [];
+  t.mock.method(globalThis, "fetch", dailySourcesFetch(sent));
+
+  const summary = await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
+  );
+
+  assert.deepEqual(sent.map((message) => message.chat_id), [1, 1]);
+  assert.deepEqual(summary.russian, { status: "ready", sent: 1, skipped: 1, errors: 0 });
+  assert.deepEqual(summary.spiritual, { status: "ready", sent: 1, skipped: 1, errors: 0 });
+  assert.equal(db.markers.has("daily:russian:2026-09-08:1"), true);
+  assert.equal(db.markers.has("daily:spiritual:2026-09-08:1"), true);
+});
+
+test("stale Spiritual is reported without sending it and does not block current Russian Daily", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    if (String(url) === "https://www.spadna.org/") {
+      return Promise.resolve(new Response(currentSpadnaFixture.replace("September 08, 2026", "September 07, 2026")));
+    }
+    return baseFetch(url, options);
+  });
+
+  const summary = await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
+  );
+
+  assert.deepEqual(sent.map((message) => message.chat_id), [1]);
+  assert.equal(summary.russian.sent, 1);
+  assert.equal(summary.spiritual.status, "not_updated");
+  assert.equal(summary.spiritual.sent, 0);
+});
+
+test("one source failure does not block the other material", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    if (String(url) === "https://na-russia.org/") return Promise.resolve(new Response("unavailable", { status: 503 }));
+    return baseFetch(url, options);
+  });
+
+  const summary = await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
+  );
+
+  assert.equal(summary.russian.status, "error");
+  assert.equal(summary.spiritual.sent, 1);
+  assert.deepEqual(sent.map((message) => message.chat_id), [1]);
+});
+
+test("force broadcast sends despite markers, preserves them and can be repeated", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  db.markers.add("daily:russian:2026-09-08:1");
+  db.markers.add("daily:spiritual:2026-09-08:1");
+  const sent = [];
+  t.mock.method(globalThis, "fetch", dailySourcesFetch(sent));
+  const env = { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" };
+
+  const first = await runDailyBroadcast(env, { force: true, today: broadcastToday });
+  const second = await runDailyBroadcast(env, { force: true, today: broadcastToday });
+
+  assert.deepEqual(sent.map((message) => message.chat_id), [1, 1, 1, 1]);
+  assert.equal(first.russian.sent, 1);
+  assert.equal(first.spiritual.sent, 1);
+  assert.equal(second.russian.sent, 1);
+  assert.equal(second.spiritual.sent, 1);
+  assert.equal(db.markers.has("daily:russian:2026-09-08:1"), true);
+  assert.equal(db.markers.has("daily:spiritual:2026-09-08:1"), true);
+});
+
+test("owner broadcast command sends a summary report to OWNER_ID", async (t) => {
+  installTimingSafeEqual(t);
+  const sent = [];
+  t.mock.method(globalThis, "fetch", telegramFetch(sent));
+  const response = await dailyWorker.fetch(webhookRequest("/daily_for_all"), {
+    DB: new FakeDB(),
+    BOT_TOKEN: "test",
+    OWNER_ID: "77",
+    TELEGRAM_WEBHOOK_SECRET: "hook-secret",
+    GEMINI_API_KEY: "unused"
+  }, { waitUntil() { throw new Error("waitUntil must not be used"); } });
+
+  assert.equal(response.status, 200);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].chat_id, "77");
+  assert.match(sent[0].text, /daily_for_all/);
+  assert.match(sent[0].text, /Active subscribers: 0/);
+  assert.match(sent[0].text, /Ежедневник/);
+  assert.match(sent[0].text, /Духовные принципы/);
+});
+
+test("duplicate /daily_force_all update_id runs the broadcast only once", async (t) => {
+  installTimingSafeEqual(t);
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const sourceCalls = { count: 0 };
+  t.mock.method(globalThis, "fetch", countedDailySourcesFetch(sent, sourceCalls));
+  const env = {
+    DB: db,
+    BOT_TOKEN: "test",
+    OWNER_ID: "77",
+    TELEGRAM_WEBHOOK_SECRET: "hook-secret",
+    GEMINI_API_KEY: "unused"
+  };
+  const ctx = { waitUntil() { throw new Error("waitUntil must not be used"); } };
+
+  const first = await dailyWorker.fetch(webhookRequest("/daily_force_all", 77, 5001), env, ctx);
+  const duplicate = await dailyWorker.fetch(webhookRequest("/daily_force_all", 77, 5001), env, ctx);
+
+  assert.equal(first.status, 200);
+  assert.equal(duplicate.status, 200);
+  assert.equal(sourceCalls.count, 2);
+  assert.equal(db.markers.has("command:daily_force_all:5001"), true);
+  assert.equal(sent.filter((message) => message.text?.includes("/daily_force_all")).length, 1);
+});
+
+test("different /daily_force_all update_id values run separate force broadcasts", async (t) => {
+  installTimingSafeEqual(t);
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const sourceCalls = { count: 0 };
+  t.mock.method(globalThis, "fetch", countedDailySourcesFetch(sent, sourceCalls));
+  const env = {
+    DB: db,
+    BOT_TOKEN: "test",
+    OWNER_ID: "77",
+    TELEGRAM_WEBHOOK_SECRET: "hook-secret",
+    GEMINI_API_KEY: "unused"
+  };
+  const ctx = { waitUntil() { throw new Error("waitUntil must not be used"); } };
+
+  await dailyWorker.fetch(webhookRequest("/daily_force_all", 77, 5002), env, ctx);
+  await dailyWorker.fetch(webhookRequest("/daily_force_all", 77, 5003), env, ctx);
+
+  assert.equal(sourceCalls.count, 4);
+  assert.equal(db.markers.has("command:daily_force_all:5002"), true);
+  assert.equal(db.markers.has("command:daily_force_all:5003"), true);
+  assert.equal(sent.filter((message) => message.text?.includes("/daily_force_all")).length, 2);
+});
+
+test("/daily_for_all deduplicates the same update_id and accepts a new one", async (t) => {
+  installTimingSafeEqual(t);
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const sourceCalls = { count: 0 };
+  t.mock.method(globalThis, "fetch", countedDailySourcesFetch(sent, sourceCalls));
+  const env = {
+    DB: db,
+    BOT_TOKEN: "test",
+    OWNER_ID: "77",
+    TELEGRAM_WEBHOOK_SECRET: "hook-secret",
+    GEMINI_API_KEY: "unused"
+  };
+  const ctx = { waitUntil() { throw new Error("waitUntil must not be used"); } };
+
+  await dailyWorker.fetch(webhookRequest("/daily_for_all", 77, 6001), env, ctx);
+  await dailyWorker.fetch(webhookRequest("/daily_for_all", 77, 6001), env, ctx);
+  await dailyWorker.fetch(webhookRequest("/daily_for_all", 77, 6002), env, ctx);
+
+  assert.equal(sourceCalls.count, 4);
+  assert.equal(db.markers.has("command:daily_for_all:6001"), true);
+  assert.equal(db.markers.has("command:daily_for_all:6002"), true);
+  assert.equal(sent.filter((message) => message.text?.includes("/daily_for_all")).length, 2);
+});
+
+test("summary shows FORCE mode and material counters", () => {
+  const text = formatBroadcastSummary("/daily_force_all", {
+    activeSubscribers: 12,
+    force: true,
+    russian: { status: "ready", sent: 12, skipped: 0, errors: 0 },
+    spiritual: { status: "not_updated", sent: 0, skipped: 0, errors: 0 },
+    deactivated: 1
+  });
+  assert.match(text, /Mode: FORCE/);
+  assert.match(text, /sent: 12/);
+  assert.match(text, /status: ещё не обновлён/);
+  assert.match(text, /deactivated: 1/);
+});
+
+test("hourly handler remains explicitly configured for normal mode", async () => {
+  const source = await readFile(new URL("../src/daily-gemini.js", import.meta.url), "utf8");
+  assert.match(source, /runDailyBroadcast\(env, \{ force: false, notifyRussianStale: true, today \}\)/);
+  assert.doesNotMatch(source, /checkScheduledDaily[\s\S]*?force: true/);
+  assert.equal(getBishkekDate(new Date("2026-09-08T03:00:00Z")).hour, 9);
+});
+
 test("/daily waits for preview completion instead of using waitUntil", async (t) => {
-  const originalTimingSafeEqual = crypto.subtle.timingSafeEqual;
-  Object.defineProperty(crypto.subtle, "timingSafeEqual", {
-    configurable: true,
-    value(left, right) {
-      const a = new Uint8Array(left);
-      const b = new Uint8Array(right);
-      if (a.length !== b.length) return false;
-      let difference = 0;
-      for (let index = 0; index < a.length; index += 1) difference |= a[index] ^ b[index];
-      return difference === 0;
-    }
-  });
-  t.after(() => {
-    if (originalTimingSafeEqual) {
-      Object.defineProperty(crypto.subtle, "timingSafeEqual", { configurable: true, value: originalTimingSafeEqual });
-    } else {
-      delete crypto.subtle.timingSafeEqual;
-    }
-  });
+  installTimingSafeEqual(t);
 
   const geminiStarted = Promise.withResolvers();
   const releaseGemini = Promise.withResolvers();
@@ -173,21 +457,9 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
   });
 
   const backgroundTasks = [];
-  const request = new Request("https://worker.example/", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Telegram-Bot-Api-Secret-Token": "hook-secret"
-    },
-    body: JSON.stringify({ message: {
-      message_id: 12,
-      text: "/daily",
-      chat: { id: 77, type: "private" },
-      from: { id: 77, username: "owner", first_name: "Owner" }
-    } })
-  });
-  const invocation = dailyWorker.fetch(request, {
-    DB: new FakeDB(),
+  const previewDb = new FakeDB();
+  const invocation = dailyWorker.fetch(webhookRequest("/daily"), {
+    DB: previewDb,
     BOT_TOKEN: "test",
     OWNER_ID: "77",
     TELEGRAM_WEBHOOK_SECRET: "hook-secret",
@@ -206,6 +478,7 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
   assert.equal(await response.text(), "OK");
   assert.equal(telegramMessages.length, 3);
   assert.match(telegramMessages.at(-1).text, /Переведённый текст/);
+  assert.equal(previewDb.markers.size, 0);
 });
 
 test("hourly, Saturday and Thursday Cron expressions remain configured", async () => {
