@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { handleUpdate } from "../src/index.js";
-import {
+import dailyWorker, {
   HOURLY_CRON,
   isCurrentEnglishDate,
   parseSpiritualPrinciple,
@@ -11,6 +11,14 @@ import {
   sendDailyToSubscribers
 } from "../src/daily-gemini.js";
 import { currentSpadnaFixture, FakeDB, telegramFetch } from "./helpers.js";
+
+const russianPreviewFixture = `
+<div class="text-lg font-bold">Тема дня</div>
+<div data-qa="meditation-date">8 сентября</div>
+<div class="text-md italic">Цитата</div>
+<div class="text-md text-secondary-blue">Источник</div>
+<div class="text-md mt-8"><p>Основной текст</p></div>
+<div class="order-2"></div>`;
 
 test("spadna parser extracts all required fields", () => {
   const parsed = parseSpiritualPrinciple(currentSpadnaFixture);
@@ -118,6 +126,86 @@ test("stale Spiritual date sends no Telegram message", async (t) => {
     [1]
   );
   assert.deepEqual(sent, []);
+});
+
+test("/daily waits for preview completion instead of using waitUntil", async (t) => {
+  const originalTimingSafeEqual = crypto.subtle.timingSafeEqual;
+  Object.defineProperty(crypto.subtle, "timingSafeEqual", {
+    configurable: true,
+    value(left, right) {
+      const a = new Uint8Array(left);
+      const b = new Uint8Array(right);
+      if (a.length !== b.length) return false;
+      let difference = 0;
+      for (let index = 0; index < a.length; index += 1) difference |= a[index] ^ b[index];
+      return difference === 0;
+    }
+  });
+  t.after(() => {
+    if (originalTimingSafeEqual) {
+      Object.defineProperty(crypto.subtle, "timingSafeEqual", { configurable: true, value: originalTimingSafeEqual });
+    } else {
+      delete crypto.subtle.timingSafeEqual;
+    }
+  });
+
+  const geminiStarted = Promise.withResolvers();
+  const releaseGemini = Promise.withResolvers();
+  const telegramMessages = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/") return new Response(russianPreviewFixture);
+    if (target === "https://www.spadna.org/") return new Response(currentSpadnaFixture);
+    if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
+      geminiStarted.resolve();
+      await releaseGemini.promise;
+      return new Response(JSON.stringify({
+        steps: [{ type: "model_output", content: [{ type: "text", text: "8 сентября 2026\nПереведённая тема\nПереведённый текст" }] }]
+      }), { headers: { "content-type": "application/json" } });
+    }
+    if (target.startsWith("https://api.telegram.org/bot")) {
+      telegramMessages.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: telegramMessages.length } }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch: ${target}`);
+  });
+
+  const backgroundTasks = [];
+  const request = new Request("https://worker.example/", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "hook-secret"
+    },
+    body: JSON.stringify({ message: {
+      message_id: 12,
+      text: "/daily",
+      chat: { id: 77, type: "private" },
+      from: { id: 77, username: "owner", first_name: "Owner" }
+    } })
+  });
+  const invocation = dailyWorker.fetch(request, {
+    DB: new FakeDB(),
+    BOT_TOKEN: "test",
+    OWNER_ID: "77",
+    TELEGRAM_WEBHOOK_SECRET: "hook-secret",
+    GEMINI_API_KEY: "test"
+  }, { waitUntil(promise) { backgroundTasks.push(promise); } });
+
+  let completed = false;
+  invocation.then(() => { completed = true; });
+  await geminiStarted.promise;
+  assert.equal(completed, false);
+  assert.equal(backgroundTasks.length, 0);
+
+  releaseGemini.resolve();
+  const response = await invocation;
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "OK");
+  assert.equal(telegramMessages.length, 3);
+  assert.match(telegramMessages.at(-1).text, /Переведённый текст/);
 });
 
 test("hourly, Saturday and Thursday Cron expressions remain configured", async () => {

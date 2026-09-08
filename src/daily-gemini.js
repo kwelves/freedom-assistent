@@ -18,7 +18,7 @@ export default {
     if (command !== "/daily" || String(message?.from?.id) !== String(env.OWNER_ID)) return workerResponse;
 
     await sendMessage(env, message.chat.id, "⏳ Получил команду. Готовлю ежедневные тексты и перевод.");
-    ctx.waitUntil(sendDailyPreview(env, message.chat.id));
+    await sendDailyPreview(env, message.chat.id);
     return new Response("OK");
   },
 
