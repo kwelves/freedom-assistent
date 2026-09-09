@@ -6,7 +6,7 @@ import { handleUpdate } from "../src/index.js";
 import dailyWorker, {
   formatBroadcastSummary,
   getBishkekDate,
-  HOURLY_CRON,
+  DAILY_CRON,
   isCurrentEnglishDate,
   parseSpiritualPrinciple,
   processSpiritualDaily,
@@ -126,6 +126,29 @@ test("English date parsing is explicit and deterministic", () => {
   assert.equal(isCurrentEnglishDate("September 08, 2026", today), true);
   assert.equal(isCurrentEnglishDate("September 07, 2026", today), false);
   assert.equal(isCurrentEnglishDate("not a date", today), false);
+});
+
+test("spadna requests bypass cache without changing the Russian source request", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const sourceRequests = new Map();
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options = {}) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/" || target === "https://www.spadna.org/") {
+      sourceRequests.set(target, options);
+    }
+    return baseFetch(url, options);
+  });
+
+  await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
+  );
+
+  assert.equal(sourceRequests.get("https://www.spadna.org/").cache, "no-store");
+  assert.equal("cache" in sourceRequests.get("https://na-russia.org/"), false);
 });
 
 test("private /start upserts an active subscriber without adding a Group username", async (t) => {
@@ -423,7 +446,7 @@ test("summary shows FORCE mode and material counters", () => {
   assert.match(text, /deactivated: 1/);
 });
 
-test("hourly handler remains explicitly configured for normal mode", async () => {
+test("Daily Cron handler remains explicitly configured for normal mode", async () => {
   const source = await readFile(new URL("../src/daily-gemini.js", import.meta.url), "utf8");
   assert.match(source, /runDailyBroadcast\(env, \{ force: false, notifyRussianStale: true, today \}\)/);
   assert.doesNotMatch(source, /checkScheduledDaily[\s\S]*?force: true/);
@@ -481,10 +504,10 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
   assert.equal(previewDb.markers.size, 0);
 });
 
-test("hourly, Saturday and Thursday Cron expressions remain configured", async () => {
+test("Daily, Saturday and Thursday Cron expressions remain configured", async () => {
   const config = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
-  assert.equal(HOURLY_CRON, "0 * * * *");
-  assert.match(config, /"0 \* \* \* \*"/);
+  assert.equal(DAILY_CRON, "*/15 3-17 * * *");
+  assert.match(config, /"\*\/15 3-17 \* \* \*"/);
   assert.match(config, /"0 11 \* \* SAT"/);
   assert.match(config, /"0 13 \* \* THU"/);
 });

@@ -1,6 +1,6 @@
 import worker from "./schedule-fix.js";
 
-export const HOURLY_CRON = "0 * * * *";
+export const DAILY_CRON = "*/15 3-17 * * *";
 const BISHKEK_TIME_ZONE = "Asia/Bishkek";
 const DAILY_START_HOUR = 9;
 const GEMINI_MODEL = "gemini-3.6-flash";
@@ -37,7 +37,7 @@ export default {
   },
 
   scheduled(controller, env, ctx) {
-    if (controller.cron === HOURLY_CRON) {
+    if (controller.cron === DAILY_CRON) {
       ctx.waitUntil(checkScheduledDaily(env));
       return;
     }
@@ -70,7 +70,7 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
   const deactivatedChatIds = new Set();
   const [russianPage, spiritualPage] = await Promise.allSettled([
     fetchPage(RUSSIAN_SOURCE_URL),
-    fetchPage(SPIRITUAL_SOURCE_URL)
+    fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
   ]);
 
   if (russianPage.status === "rejected") {
@@ -313,7 +313,7 @@ async function sendDailyPreview(env, chatId) {
   try {
     const [russianHtml, spiritualHtml] = await Promise.all([
       fetchPage(RUSSIAN_SOURCE_URL),
-      fetchPage(SPIRITUAL_SOURCE_URL)
+      fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
     ]);
     const russianMeditation = parseRussianMeditation(russianHtml);
     const spiritualPrinciple = parseSpiritualPrinciple(spiritualHtml);
@@ -326,8 +326,11 @@ async function sendDailyPreview(env, chatId) {
   }
 }
 
-async function fetchPage(url) {
-  const response = await fetch(url, { headers: { "user-agent": "FreedomHelperBot/1.0" } });
+async function fetchPage(url, { bypassCache = false } = {}) {
+  const response = await fetch(url, {
+    ...(bypassCache ? { cache: "no-store" } : {}),
+    headers: { "user-agent": "FreedomHelperBot/1.0" }
+  });
   if (!response.ok) throw new Error(`Источник недоступен: ${url} (${response.status})`);
   return response.text();
 }
