@@ -11,7 +11,8 @@ import dailyWorker, {
   parseSpiritualPrinciple,
   processSpiritualDaily,
   runDailyBroadcast,
-  sendDailyToSubscribers
+  sendDailyToSubscribers,
+  SPIRITUAL_SOURCE_URL
 } from "../src/daily-gemini.js";
 import { currentSpadnaFixture, FakeDB, telegramFetch } from "./helpers.js";
 
@@ -62,7 +63,7 @@ function dailySourcesFetch(telegramMessages, failures = new Map()) {
   return async (url, options = {}) => {
     const target = String(url);
     if (target === "https://na-russia.org/") return new Response(russianPreviewFixture);
-    if (target === "https://www.spadna.org/") return new Response(currentSpadnaFixture);
+    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
       return new Response(JSON.stringify({
         steps: [{ type: "model_output", content: [{ type: "text", text: "8 сентября 2026\nПереведённая тема\nПереведённый текст" }] }]
@@ -90,7 +91,7 @@ function countedDailySourcesFetch(telegramMessages, sourceCalls) {
   const baseFetch = dailySourcesFetch(telegramMessages);
   return (url, options) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === "https://www.spadna.org/") {
+    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) {
       sourceCalls.count += 1;
     }
     return baseFetch(url, options);
@@ -128,7 +129,7 @@ test("English date parsing is explicit and deterministic", () => {
   assert.equal(isCurrentEnglishDate("not a date", today), false);
 });
 
-test("spadna requests bypass cache without changing the Russian source request", async (t) => {
+test("spadna requests use the Bishkek timezone and bypass cache without changing the Russian source request", async (t) => {
   const db = new FakeDB();
   db.subscribers.set(1, { chat_id: 1, active: 1 });
   const sent = [];
@@ -136,7 +137,7 @@ test("spadna requests bypass cache without changing the Russian source request",
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options = {}) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === "https://www.spadna.org/") {
+    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) {
       sourceRequests.set(target, options);
     }
     return baseFetch(url, options);
@@ -147,7 +148,11 @@ test("spadna requests bypass cache without changing the Russian source request",
     { force: false, today: broadcastToday }
   );
 
-  assert.equal(sourceRequests.get("https://www.spadna.org/").cache, "no-store");
+  assert.equal(SPIRITUAL_SOURCE_URL, "https://www.spadna.org/?timeZone=Asia%2FBishkek");
+  const spiritualUrl = new URL(SPIRITUAL_SOURCE_URL);
+  assert.equal(`${spiritualUrl.origin}${spiritualUrl.pathname}`, "https://www.spadna.org/");
+  assert.equal(spiritualUrl.searchParams.get("timeZone"), "Asia/Bishkek");
+  assert.equal(sourceRequests.get(SPIRITUAL_SOURCE_URL).cache, "no-store");
   assert.equal("cache" in sourceRequests.get("https://na-russia.org/"), false);
 });
 
@@ -278,7 +283,7 @@ test("stale Spiritual is reported without sending it and does not block current 
   t.mock.method(console, "log", (message) => logs.push(JSON.parse(message)));
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options) => {
-    if (String(url) === "https://www.spadna.org/") {
+    if (String(url) === SPIRITUAL_SOURCE_URL) {
       return Promise.resolve(new Response(currentSpadnaFixture.replace("September 08, 2026", "September 07, 2026")));
     }
     return baseFetch(url, options);
@@ -488,7 +493,7 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
   t.mock.method(globalThis, "fetch", async (url, options = {}) => {
     const target = String(url);
     if (target === "https://na-russia.org/") return new Response(russianPreviewFixture);
-    if (target === "https://www.spadna.org/") return new Response(currentSpadnaFixture);
+    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
       geminiStarted.resolve();
       await releaseGemini.promise;

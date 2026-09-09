@@ -2,10 +2,11 @@ import worker from "./schedule-fix.js";
 
 export const DAILY_CRON = "*/15 3-17 * * *";
 const BISHKEK_TIME_ZONE = "Asia/Bishkek";
+const SPIRITUAL_TIME_ZONE = BISHKEK_TIME_ZONE;
 const DAILY_START_HOUR = 9;
 const GEMINI_MODEL = "gemini-3.6-flash";
 const RUSSIAN_SOURCE_URL = "https://na-russia.org/";
-export const SPIRITUAL_SOURCE_URL = "https://www.spadna.org/";
+export const SPIRITUAL_SOURCE_URL = `https://www.spadna.org/?timeZone=${encodeURIComponent(SPIRITUAL_TIME_ZONE)}`;
 
 export default {
   async fetch(request, env, ctx) {
