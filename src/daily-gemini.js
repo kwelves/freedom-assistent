@@ -105,7 +105,18 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
     try {
       const spiritualPrinciple = parseSpiritualPrinciple(spiritualPage.value);
       if (!isCurrentEnglishDate(spiritualPrinciple.date, today)) {
-        summary.spiritual.status = "not_updated";
+        Object.assign(summary.spiritual, {
+          status: "not_updated",
+          sourceDate: spiritualPrinciple.date,
+          todayKey: today.key,
+          todayHour: today.hour
+        });
+        console.log(JSON.stringify({
+          event: "spiritual_date_mismatch",
+          source_date: spiritualPrinciple.date,
+          today_key: today.key,
+          today_hour: today.hour
+        }));
       } else {
         const pendingSubscribers = force
           ? subscribers.filter((chatId) => !deactivatedChatIds.has(chatId))
@@ -160,7 +171,10 @@ export function formatBroadcastSummary(command, summary) {
       : material.status === "error"
         ? "\nstatus: ошибка источника/обработки"
         : "";
-    return `${title}:${status}\nsent: ${material.sent}\nskipped: ${material.skipped}\nerrors: ${material.errors}`;
+    const dateMismatch = material.status === "not_updated" && material.sourceDate !== undefined
+      ? `\nsource date: ${material.sourceDate}\nworker today: ${material.todayKey}\nworker hour: ${material.todayHour}`
+      : "";
+    return `${title}:${status}${dateMismatch}\nsent: ${material.sent}\nskipped: ${material.skipped}\nerrors: ${material.errors}`;
   };
   return [
     `✅ ${command} завершена`,

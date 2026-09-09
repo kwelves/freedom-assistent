@@ -274,6 +274,8 @@ test("stale Spiritual is reported without sending it and does not block current 
   const db = new FakeDB();
   db.subscribers.set(1, { chat_id: 1, active: 1 });
   const sent = [];
+  const logs = [];
+  t.mock.method(console, "log", (message) => logs.push(JSON.parse(message)));
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options) => {
     if (String(url) === "https://www.spadna.org/") {
@@ -289,8 +291,21 @@ test("stale Spiritual is reported without sending it and does not block current 
 
   assert.deepEqual(sent.map((message) => message.chat_id), [1]);
   assert.equal(summary.russian.sent, 1);
-  assert.equal(summary.spiritual.status, "not_updated");
-  assert.equal(summary.spiritual.sent, 0);
+  assert.deepEqual(summary.spiritual, {
+    status: "not_updated",
+    sent: 0,
+    skipped: 0,
+    errors: 0,
+    sourceDate: "September 07, 2026",
+    todayKey: "2026-09-08",
+    todayHour: 10
+  });
+  assert.deepEqual(logs, [{
+    event: "spiritual_date_mismatch",
+    source_date: "September 07, 2026",
+    today_key: "2026-09-08",
+    today_hour: 10
+  }]);
 });
 
 test("one source failure does not block the other material", async (t) => {
@@ -437,12 +452,23 @@ test("summary shows FORCE mode and material counters", () => {
     activeSubscribers: 12,
     force: true,
     russian: { status: "ready", sent: 12, skipped: 0, errors: 0 },
-    spiritual: { status: "not_updated", sent: 0, skipped: 0, errors: 0 },
+    spiritual: {
+      status: "not_updated",
+      sent: 0,
+      skipped: 0,
+      errors: 0,
+      sourceDate: "September 08, 2026",
+      todayKey: "2026-09-09",
+      todayHour: 9
+    },
     deactivated: 1
   });
   assert.match(text, /Mode: FORCE/);
   assert.match(text, /sent: 12/);
   assert.match(text, /status: ещё не обновлён/);
+  assert.match(text, /source date: September 08, 2026/);
+  assert.match(text, /worker today: 2026-09-09/);
+  assert.match(text, /worker hour: 9/);
   assert.match(text, /deactivated: 1/);
 });
 
