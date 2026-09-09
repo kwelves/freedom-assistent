@@ -4,9 +4,10 @@ import test from "node:test";
 
 import { handleUpdate } from "../src/index.js";
 import dailyWorker, {
+  checkScheduledDaily,
+  DAILY_CRONS,
   formatBroadcastSummary,
   getBishkekDate,
-  DAILY_CRON,
   isCurrentEnglishDate,
   parseSpiritualPrinciple,
   processSpiritualDaily,
@@ -275,6 +276,98 @@ test("normal broadcast sends pending recipients, skips existing markers and crea
   assert.equal(db.markers.has("daily:spiritual:2026-09-08:1"), true);
 });
 
+test("normal broadcast exits before fetch when every active subscriber has both markers", async (t) => {
+  const db = new FakeDB();
+  for (const chatId of [1, 2]) {
+    db.subscribers.set(chatId, { chat_id: chatId, active: 1 });
+    db.markers.add(`daily:russian:2026-09-08:${chatId}`);
+    db.markers.add(`daily:spiritual:2026-09-08:${chatId}`);
+  }
+  const calls = { sources: 0, gemini: 0, telegram: 0 };
+  t.mock.method(globalThis, "fetch", async (url) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) calls.sources += 1;
+    if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") calls.gemini += 1;
+    if (target.startsWith("https://api.telegram.org/bot")) calls.telegram += 1;
+    throw new Error(`Unexpected fetch: ${target}`);
+  });
+
+  const summary = await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
+  );
+
+  assert.deepEqual(calls, { sources: 0, gemini: 0, telegram: 0 });
+  assert.deepEqual(summary.russian, { status: "ready", sent: 0, skipped: 2, errors: 0 });
+  assert.deepEqual(summary.spiritual, { status: "ready", sent: 0, skipped: 2, errors: 0 });
+});
+
+test("normal broadcast fetches and sends only Spiritual when Russian is complete", async (t) => {
+  const db = new FakeDB();
+  for (const chatId of [1, 2]) db.subscribers.set(chatId, { chat_id: chatId, active: 1 });
+  db.markers.add("daily:russian:2026-09-08:1");
+  db.markers.add("daily:russian:2026-09-08:2");
+  db.markers.add("daily:spiritual:2026-09-08:1");
+  const sent = [];
+  const sources = [];
+  let geminiCalls = 0;
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) sources.push(target);
+    if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") geminiCalls += 1;
+    return baseFetch(url, options);
+  });
+
+  const summary = await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
+  );
+
+  assert.deepEqual(sources, [SPIRITUAL_SOURCE_URL]);
+  assert.equal(geminiCalls, 1);
+  assert.deepEqual(sent.map((message) => message.chat_id), [2]);
+  assert.deepEqual(summary.russian, { status: "ready", sent: 0, skipped: 2, errors: 0 });
+  assert.deepEqual(summary.spiritual, { status: "ready", sent: 1, skipped: 1, errors: 0 });
+});
+
+test("a new active subscriber without markers makes both materials pending again", async (t) => {
+  const db = new FakeDB();
+  for (const chatId of [1, 2, 3, 4, 5, 6]) {
+    db.subscribers.set(chatId, { chat_id: chatId, active: 1 });
+    db.markers.add(`daily:russian:2026-09-08:${chatId}`);
+    db.markers.add(`daily:spiritual:2026-09-08:${chatId}`);
+  }
+  const sent = [];
+  const sources = [];
+  let geminiCalls = 0;
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) sources.push(target);
+    if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") geminiCalls += 1;
+    return baseFetch(url, options);
+  });
+  const env = { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" };
+
+  const complete = await runDailyBroadcast(env, { force: false, today: broadcastToday });
+  assert.deepEqual(sources, []);
+  assert.deepEqual(sent, []);
+  assert.equal(complete.russian.skipped, 6);
+  assert.equal(complete.spiritual.skipped, 6);
+
+  db.subscribers.set(7, { chat_id: 7, active: 1 });
+  const withNewSubscriber = await runDailyBroadcast(env, { force: false, today: broadcastToday });
+
+  assert.deepEqual(sources, ["https://na-russia.org/", SPIRITUAL_SOURCE_URL]);
+  assert.equal(geminiCalls, 1);
+  assert.deepEqual(sent.map((message) => message.chat_id), [7, 7]);
+  assert.equal(withNewSubscriber.russian.sent, 1);
+  assert.equal(withNewSubscriber.russian.skipped, 6);
+  assert.equal(withNewSubscriber.spiritual.sent, 1);
+  assert.equal(withNewSubscriber.spiritual.skipped, 6);
+});
+
 test("stale Spiritual is reported without sending it and does not block current Russian Daily", async (t) => {
   const db = new FakeDB();
   db.subscribers.set(1, { chat_id: 1, active: 1 });
@@ -339,7 +432,8 @@ test("force broadcast sends despite markers, preserves them and can be repeated"
   db.markers.add("daily:russian:2026-09-08:1");
   db.markers.add("daily:spiritual:2026-09-08:1");
   const sent = [];
-  t.mock.method(globalThis, "fetch", dailySourcesFetch(sent));
+  const sourceCalls = { count: 0 };
+  t.mock.method(globalThis, "fetch", countedDailySourcesFetch(sent, sourceCalls));
   const env = { DB: db, BOT_TOKEN: "test", GEMINI_API_KEY: "test" };
 
   const first = await runDailyBroadcast(env, { force: true, today: broadcastToday });
@@ -350,6 +444,7 @@ test("force broadcast sends despite markers, preserves them and can be repeated"
   assert.equal(first.spiritual.sent, 1);
   assert.equal(second.russian.sent, 1);
   assert.equal(second.spiritual.sent, 1);
+  assert.equal(sourceCalls.count, 4);
   assert.equal(db.markers.has("daily:russian:2026-09-08:1"), true);
   assert.equal(db.markers.has("daily:spiritual:2026-09-08:1"), true);
 });
@@ -477,11 +572,81 @@ test("summary shows FORCE mode and material counters", () => {
   assert.match(text, /deactivated: 1/);
 });
 
-test("Daily Cron handler remains explicitly configured for normal mode", async () => {
+test("Daily Cron handler remains explicitly configured for silent normal mode", async () => {
   const source = await readFile(new URL("../src/daily-gemini.js", import.meta.url), "utf8");
-  assert.match(source, /runDailyBroadcast\(env, \{ force: false, notifyRussianStale: true, today \}\)/);
+  assert.match(source, /runDailyBroadcast\(env, \{ force: false, today \}\)/);
+  assert.doesNotMatch(source, /checkScheduledDaily[\s\S]*?notifyRussianStale: true/);
   assert.doesNotMatch(source, /checkScheduledDaily[\s\S]*?force: true/);
   assert.equal(getBishkekDate(new Date("2026-09-08T03:00:00Z")).hour, 9);
+});
+
+test("scheduled stale Russian source does not send an OWNER notification", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  db.markers.add("daily:spiritual:2026-09-08:1");
+  const sourceRequests = [];
+  const telegramMessages = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    const target = String(url);
+    if (target === "https://na-russia.org/") {
+      sourceRequests.push(target);
+      return new Response(russianPreviewFixture.replace("8 сентября", "7 сентября"));
+    }
+    if (target === SPIRITUAL_SOURCE_URL) {
+      sourceRequests.push(target);
+      return new Response(currentSpadnaFixture);
+    }
+    if (target.startsWith("https://api.telegram.org/bot")) {
+      telegramMessages.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch: ${target}`);
+  });
+
+  await checkScheduledDaily(
+    { DB: db, BOT_TOKEN: "test", OWNER_ID: "77" },
+    { ...broadcastToday, minute: 15 }
+  );
+
+  assert.deepEqual(sourceRequests, ["https://na-russia.org/"]);
+  assert.deepEqual(telegramMessages, []);
+});
+
+test("scheduled recognizes both Daily Cron expressions", async () => {
+  const tasks = [];
+  const env = { DB: new FakeDB() };
+  const ctx = { waitUntil(promise) { tasks.push(promise); } };
+
+  for (const cron of DAILY_CRONS) dailyWorker.scheduled({ cron }, env, ctx);
+
+  assert.equal(tasks.length, 2);
+  await Promise.all(tasks);
+});
+
+test("checkScheduledDaily allows 13:59 and 14:00 but stops outside the safety window", async () => {
+  const dailyRuns = [];
+  const env = {
+    DB: {
+      prepare(sql) {
+        assert.match(sql, /SELECT chat_id FROM subscribers/);
+        return { async all() { dailyRuns.push(sql); return { results: [] }; } };
+      }
+    }
+  };
+  const today = (hour, minute) => ({
+    key: "2026-09-08", year: 2026, month: 9, day: 8, hour, minute
+  });
+
+  await checkScheduledDaily(env, today(8, 59));
+  assert.equal(dailyRuns.length, 0);
+  await checkScheduledDaily(env, today(13, 59));
+  assert.equal(dailyRuns.length, 1);
+  await checkScheduledDaily(env, today(14, 0));
+  assert.equal(dailyRuns.length, 2);
+  await checkScheduledDaily(env, today(14, 1));
+  assert.equal(dailyRuns.length, 2);
 });
 
 test("/daily waits for preview completion instead of using waitUntil", async (t) => {
@@ -490,10 +655,17 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
   const geminiStarted = Promise.withResolvers();
   const releaseGemini = Promise.withResolvers();
   const telegramMessages = [];
+  const sourceRequests = [];
   t.mock.method(globalThis, "fetch", async (url, options = {}) => {
     const target = String(url);
-    if (target === "https://na-russia.org/") return new Response(russianPreviewFixture);
-    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
+    if (target === "https://na-russia.org/") {
+      sourceRequests.push(target);
+      return new Response(russianPreviewFixture);
+    }
+    if (target === SPIRITUAL_SOURCE_URL) {
+      sourceRequests.push(target);
+      return new Response(currentSpadnaFixture);
+    }
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
       geminiStarted.resolve();
       await releaseGemini.promise;
@@ -530,6 +702,7 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
   const response = await invocation;
   assert.equal(response.status, 200);
   assert.equal(await response.text(), "OK");
+  assert.deepEqual(sourceRequests, ["https://na-russia.org/", SPIRITUAL_SOURCE_URL]);
   assert.equal(telegramMessages.length, 3);
   assert.match(telegramMessages.at(-1).text, /Переведённый текст/);
   assert.equal(previewDb.markers.size, 0);
@@ -537,8 +710,10 @@ test("/daily waits for preview completion instead of using waitUntil", async (t)
 
 test("Daily, Saturday and Thursday Cron expressions remain configured", async () => {
   const config = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
-  assert.equal(DAILY_CRON, "*/15 3-17 * * *");
-  assert.match(config, /"\*\/15 3-17 \* \* \*"/);
+  assert.deepEqual(DAILY_CRONS, ["*/15 3-7 * * *", "0 8 * * *"]);
+  assert.match(config, /"\*\/15 3-7 \* \* \*"/);
+  assert.match(config, /"0 8 \* \* \*"/);
+  assert.doesNotMatch(config, /"\*\/15 3-17 \* \* \*"/);
   assert.match(config, /"0 11 \* \* SAT"/);
   assert.match(config, /"0 13 \* \* THU"/);
 });

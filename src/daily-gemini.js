@@ -1,9 +1,10 @@
 import worker from "./schedule-fix.js";
 
-export const DAILY_CRON = "*/15 3-17 * * *";
+export const DAILY_CRONS = ["*/15 3-7 * * *", "0 8 * * *"];
 const BISHKEK_TIME_ZONE = "Asia/Bishkek";
 const SPIRITUAL_TIME_ZONE = BISHKEK_TIME_ZONE;
 const DAILY_START_HOUR = 9;
+const DAILY_END_HOUR = 14;
 const GEMINI_MODEL = "gemini-3.6-flash";
 const RUSSIAN_SOURCE_URL = "https://na-russia.org/";
 export const SPIRITUAL_SOURCE_URL = `https://www.spadna.org/?timeZone=${encodeURIComponent(SPIRITUAL_TIME_ZONE)}`;
@@ -38,7 +39,7 @@ export default {
   },
 
   scheduled(controller, env, ctx) {
-    if (controller.cron === DAILY_CRON) {
+    if (DAILY_CRONS.includes(controller.cron)) {
       ctx.waitUntil(checkScheduledDaily(env));
       return;
     }
@@ -46,12 +47,13 @@ export default {
   }
 };
 
-export async function checkScheduledDaily(env) {
-  const today = getBishkekDate();
-  if (today.hour < DAILY_START_HOUR) return;
+export async function checkScheduledDaily(env, today = getBishkekDate()) {
+  if (today.hour < DAILY_START_HOUR
+    || today.hour > DAILY_END_HOUR
+    || (today.hour === DAILY_END_HOUR && today.minute > 0)) return;
 
   try {
-    await runDailyBroadcast(env, { force: false, notifyRussianStale: true, today });
+    await runDailyBroadcast(env, { force: false, today });
   } catch (error) {
     console.error(JSON.stringify({ event: "scheduled_daily_check_failed", error: String(error) }));
   }
@@ -69,12 +71,30 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
   if (!subscribers.length) return summary;
 
   const deactivatedChatIds = new Set();
+  let pendingRussian = subscribers;
+  let pendingSpiritual = subscribers;
+  if (!force) {
+    [pendingRussian, pendingSpiritual] = await Promise.all([
+      getPendingSubscribers(env, "russian", today.key, subscribers),
+      getPendingSubscribers(env, "spiritual", today.key, subscribers)
+    ]);
+    if (!pendingRussian.length && !pendingSpiritual.length) {
+      summary.russian.skipped = subscribers.length;
+      summary.spiritual.skipped = subscribers.length;
+      return summary;
+    }
+  }
+
+  const shouldFetchRussian = force || pendingRussian.length > 0;
+  const shouldFetchSpiritual = force || pendingSpiritual.length > 0;
   const [russianPage, spiritualPage] = await Promise.allSettled([
-    fetchPage(RUSSIAN_SOURCE_URL),
-    fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
+    shouldFetchRussian ? fetchPage(RUSSIAN_SOURCE_URL) : null,
+    shouldFetchSpiritual ? fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true }) : null
   ]);
 
-  if (russianPage.status === "rejected") {
+  if (!shouldFetchRussian) {
+    summary.russian.skipped = subscribers.length;
+  } else if (russianPage.status === "rejected") {
     markMaterialError(summary.russian, russianPage.reason);
   } else {
     try {
@@ -100,7 +120,9 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
     }
   }
 
-  if (spiritualPage.status === "rejected") {
+  if (!shouldFetchSpiritual) {
+    summary.spiritual.skipped = subscribers.length;
+  } else if (spiritualPage.status === "rejected") {
     markMaterialError(summary.spiritual, spiritualPage.reason);
   } else {
     try {
@@ -119,9 +141,8 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
           today_hour: today.hour
         }));
       } else {
-        const pendingSubscribers = force
-          ? subscribers.filter((chatId) => !deactivatedChatIds.has(chatId))
-          : await getPendingSubscribers(env, "spiritual", today.key, subscribers, deactivatedChatIds);
+        const pendingSubscribers = (force ? subscribers : pendingSpiritual)
+          .filter((chatId) => !deactivatedChatIds.has(chatId));
         if (!pendingSubscribers.length) {
           summary.spiritual.skipped = subscribers.length - deactivatedChatIds.size;
         } else {
@@ -212,6 +233,7 @@ export function getBishkekDate(date = new Date()) {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
+    minute: "2-digit",
     hourCycle: "h23"
   }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
 
@@ -220,7 +242,8 @@ export function getBishkekDate(date = new Date()) {
     year: Number(parts.year),
     month: Number(parts.month),
     day: Number(parts.day),
-    hour: Number(parts.hour)
+    hour: Number(parts.hour),
+    minute: Number(parts.minute)
   };
 }
 
