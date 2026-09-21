@@ -101,7 +101,7 @@ function countedDailySourcesFetch(telegramMessages, sourceCalls) {
 
 const broadcastToday = { key: "2026-09-08", year: 2026, month: 9, day: 8, hour: 10 };
 
-test("spadna parser extracts all required fields", () => {
+test("na.org/spadna parser extracts all required fields from the current heading markup", () => {
   const parsed = parseSpiritualPrinciple(currentSpadnaFixture);
   assert.equal(parsed.date, "September 08, 2026");
   assert.equal(parsed.title, "Gratitude Transforms Us");
@@ -149,9 +149,9 @@ test("spadna requests use the Bishkek timezone and bypass cache without changing
     { force: false, today: broadcastToday }
   );
 
-  assert.equal(SPIRITUAL_SOURCE_URL, "https://www.spadna.org/?timeZone=Asia%2FBishkek");
+  assert.equal(SPIRITUAL_SOURCE_URL, "https://na.org/spadna/?timeZone=Asia%2FBishkek");
   const spiritualUrl = new URL(SPIRITUAL_SOURCE_URL);
-  assert.equal(`${spiritualUrl.origin}${spiritualUrl.pathname}`, "https://www.spadna.org/");
+  assert.equal(`${spiritualUrl.origin}${spiritualUrl.pathname}`, "https://na.org/spadna/");
   assert.equal(spiritualUrl.searchParams.get("timeZone"), "Asia/Bishkek");
   assert.equal(sourceRequests.get(SPIRITUAL_SOURCE_URL).cache, "no-store");
   assert.equal("cache" in sourceRequests.get("https://na-russia.org/"), false);

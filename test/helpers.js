@@ -88,7 +88,7 @@ export function telegramFetch(sent, failures = new Map()) {
 export const currentSpadnaFixture = `
 <html><body><table align="center">
 <tr><td align="left"><h2>September 08, 2026</h2></td></tr>
-<tr><td align="center"><h1>Gratitude Transforms Us</h1></td></tr>
+<tr><td align="center"><h2 class="heading1">Gratitude Transforms Us</h2></td></tr>
 <tr><td align="center">Page 260<br><br></td></tr>
 <tr><td align="left">"Gratitude in action is an engine for change: As we carry the message, our own lives transform."<br><br></td></tr>
 <tr><td align="center">Guiding Principles, Tradition Five, Opening Reflection<br><br></td></tr>

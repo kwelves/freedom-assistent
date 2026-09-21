@@ -7,7 +7,7 @@ const DAILY_START_HOUR = 9;
 const DAILY_END_HOUR = 14;
 const GEMINI_MODEL = "gemini-3.6-flash";
 const RUSSIAN_SOURCE_URL = "https://na-russia.org/";
-export const SPIRITUAL_SOURCE_URL = `https://www.spadna.org/?timeZone=${encodeURIComponent(SPIRITUAL_TIME_ZONE)}`;
+export const SPIRITUAL_SOURCE_URL = `https://na.org/spadna/?timeZone=${encodeURIComponent(SPIRITUAL_TIME_ZONE)}`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -398,7 +398,8 @@ export function parseSpiritualPrinciple(html) {
   })).filter((row) => row.text);
 
   const dateRow = rows.find((row) => /<h2\b/i.test(row.html));
-  const titleRow = rows.find((row) => /<h1\b/i.test(row.html));
+  const titleRow = rows.find((row) => /<h1\b/i.test(row.html)
+    || /<h2\b[^>]*class=["'][^"']*\bheading1\b[^"']*["']/i.test(row.html));
   if (!dateRow || !titleRow) throw new Error("Не найдены дата или заголовок Spiritual Principle на spadna.org");
 
   const titleIndex = rows.indexOf(titleRow);

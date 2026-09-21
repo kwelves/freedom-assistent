@@ -3,9 +3,9 @@ import test from "node:test";
 
 import { isCurrentEnglishDate, parseSpiritualPrinciple, SPIRITUAL_SOURCE_URL } from "../../src/daily-gemini.js";
 
-test("current spadna.org HTML is parsed", async () => {
+test("current na.org/spadna HTML is parsed", async () => {
   const response = await fetch(SPIRITUAL_SOURCE_URL, { headers: { "user-agent": "FreedomHelperBot/1.0" } });
-  assert.equal(response.ok, true, `spadna.org returned ${response.status}`);
+  assert.equal(response.ok, true, `na.org/spadna returned ${response.status}`);
   const parsed = parseSpiritualPrinciple(await response.text());
   assert.ok(parsed.date);
   assert.ok(parsed.title);
@@ -23,5 +23,5 @@ test("current spadna.org HTML is parsed", async () => {
     year: Number(parts.year),
     month: Number(parts.month),
     day: Number(parts.day)
-  }), true, `spadna.org date is stale: ${parsed.date}`);
+  }), true, `na.org/spadna date is stale: ${parsed.date}`);
 });
