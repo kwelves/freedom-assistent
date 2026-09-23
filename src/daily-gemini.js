@@ -1,11 +1,12 @@
 import worker from "./schedule-fix.js";
+import { translateToRussian } from "./translate.js";
 
 export const DAILY_CRONS = ["*/15 3-7 * * *", "0 8 * * *"];
+export const DAILY_PREPARE_CRON = "55 2 * * *";
 const BISHKEK_TIME_ZONE = "Asia/Bishkek";
 const SPIRITUAL_TIME_ZONE = BISHKEK_TIME_ZONE;
 const DAILY_START_HOUR = 9;
 const DAILY_END_HOUR = 14;
-const GEMINI_MODEL = "gemini-3.6-flash";
 const RUSSIAN_SOURCE_URL = "https://na-russia.org/";
 export const SPIRITUAL_SOURCE_URL = `https://na.org/spadna/?timeZone=${encodeURIComponent(SPIRITUAL_TIME_ZONE)}`;
 
@@ -20,8 +21,16 @@ export default {
     const isOwner = String(message?.from?.id) === String(env.OWNER_ID);
 
     if (command === "/daily" && isOwner) {
-      await sendMessage(env, message.chat.id, "⏳ Получил команду. Готовлю ежедневные тексты и перевод.");
-      await sendDailyPreview(env, message.chat.id);
+      const today = getBishkekDate();
+      const result = await sendDailyPreviewFromCache(env, message.chat.id, today);
+      if (result.missing.length) {
+        await sendMessage(
+          env,
+          message.chat.id,
+          `⌛ Материалы за ${today.key} ещё не готовы: ${result.missing.join(", ")}. Готовлю кеш в фоне.`
+        );
+        ctx.waitUntil(prepareDailyCache(env, today));
+      }
       return new Response("OK");
     }
 
@@ -39,6 +48,10 @@ export default {
   },
 
   scheduled(controller, env, ctx) {
+    if (controller.cron === DAILY_PREPARE_CRON) {
+      ctx.waitUntil(prepareDailyCache(env));
+      return;
+    }
     if (DAILY_CRONS.includes(controller.cron)) {
       ctx.waitUntil(checkScheduledDaily(env));
       return;
@@ -87,79 +100,67 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
 
   const shouldFetchRussian = force || pendingRussian.length > 0;
   const shouldFetchSpiritual = force || pendingSpiritual.length > 0;
-  const [russianPage, spiritualPage] = await Promise.allSettled([
-    shouldFetchRussian ? fetchPage(RUSSIAN_SOURCE_URL) : null,
-    shouldFetchSpiritual ? fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true }) : null
-  ]);
+  let cache;
+  try {
+    cache = await prepareDailyCache(env, today, {
+      russian: shouldFetchRussian,
+      spiritual: shouldFetchSpiritual
+    });
+  } catch (error) {
+    if (shouldFetchRussian) markMaterialError(summary.russian, error);
+    if (shouldFetchSpiritual) markMaterialError(summary.spiritual, error);
+    return summary;
+  }
 
   if (!shouldFetchRussian) {
     summary.russian.skipped = subscribers.length;
-  } else if (russianPage.status === "rejected") {
-    markMaterialError(summary.russian, russianPage.reason);
-  } else {
-    try {
-      const russianMeditation = parseRussianMeditation(russianPage.value);
-      if (!isCurrentRussianDate(russianMeditation.date, today)) {
-        summary.russian.status = "not_updated";
-        if (notifyRussianStale) {
-          await sendMessage(env, env.OWNER_ID, "⌛ Дата Ежедневника ещё не изменилась. Проверю снова через час.");
-        }
-      } else {
-        Object.assign(summary.russian, await sendDailyToSubscribers(
-          env,
-          "russian",
-          today.key,
-          "ЕЖЕДНЕВНИК",
-          russianMeditation,
-          subscribers,
-          { force, deactivatedChatIds }
-        ));
-      }
-    } catch (error) {
-      markMaterialError(summary.russian, error);
+  } else if (cache.errors.russian) {
+    markMaterialError(summary.russian, cache.errors.russian);
+  } else if (!cache.russian) {
+    summary.russian.status = "not_updated";
+    if (notifyRussianStale) {
+      await sendMessage(env, env.OWNER_ID, "⌛ Дата Ежедневника ещё не изменилась. Проверю снова через час.");
     }
+  } else {
+    Object.assign(summary.russian, await sendDailyToSubscribers(
+      env,
+      "russian",
+      today.key,
+      "ЕЖЕДНЕВНИК",
+      cache.russian.payload,
+      subscribers,
+      { force, deactivatedChatIds }
+    ));
   }
 
   if (!shouldFetchSpiritual) {
     summary.spiritual.skipped = subscribers.length;
-  } else if (spiritualPage.status === "rejected") {
-    markMaterialError(summary.spiritual, spiritualPage.reason);
+  } else if (cache.errors.spiritual) {
+    markMaterialError(summary.spiritual, cache.errors.spiritual);
+  } else if (!cache.spiritual) {
+    Object.assign(summary.spiritual, {
+      status: "not_updated",
+      ...(cache.notUpdated.spiritual ? {
+        sourceDate: cache.notUpdated.spiritual,
+        todayKey: today.key,
+        todayHour: today.hour
+      } : {})
+    });
   } else {
-    try {
-      const spiritualPrinciple = parseSpiritualPrinciple(spiritualPage.value);
-      if (!isCurrentEnglishDate(spiritualPrinciple.date, today)) {
-        Object.assign(summary.spiritual, {
-          status: "not_updated",
-          sourceDate: spiritualPrinciple.date,
-          todayKey: today.key,
-          todayHour: today.hour
-        });
-        console.log(JSON.stringify({
-          event: "spiritual_date_mismatch",
-          source_date: spiritualPrinciple.date,
-          today_key: today.key,
-          today_hour: today.hour
-        }));
-      } else {
-        const pendingSubscribers = (force ? subscribers : pendingSpiritual)
-          .filter((chatId) => !deactivatedChatIds.has(chatId));
-        if (!pendingSubscribers.length) {
-          summary.spiritual.skipped = subscribers.length - deactivatedChatIds.size;
-        } else {
-          const translation = await translateToRussian(env, spiritualPrinciple.raw);
-          Object.assign(summary.spiritual, await sendDailyToSubscribers(
-            env,
-            "spiritual",
-            today.key,
-            "ДУХОВНЫЕ ПРИНЦИПЫ",
-            splitDailyText(translation),
-            subscribers,
-            { force, deactivatedChatIds }
-          ));
-        }
-      }
-    } catch (error) {
-      markMaterialError(summary.spiritual, error);
+    const pendingSubscribers = (force ? subscribers : pendingSpiritual)
+      .filter((chatId) => !deactivatedChatIds.has(chatId));
+    if (!pendingSubscribers.length) {
+      summary.spiritual.skipped = subscribers.length - deactivatedChatIds.size;
+    } else {
+      Object.assign(summary.spiritual, await sendDailyToSubscribers(
+        env,
+        "spiritual",
+        today.key,
+        "ДУХОВНЫЕ ПРИНЦИПЫ",
+        cache.spiritual.payload,
+        subscribers,
+        { force, deactivatedChatIds }
+      ));
     }
   }
 
@@ -206,6 +207,99 @@ export function formatBroadcastSummary(command, summary) {
     materialLines("Духовные принципы", summary.spiritual),
     `deactivated: ${summary.deactivated}`
   ].join("\n\n");
+}
+
+export async function prepareDailyCache(
+  env,
+  today = getBishkekDate(),
+  requested = { russian: true, spiritual: true }
+) {
+  const cache = await getDailyCache(env, today);
+  const errors = {};
+  const notUpdated = {};
+  const tasks = [];
+
+  if (requested.russian && !cache.russian) {
+    tasks.push((async () => {
+      try {
+        const meditation = parseRussianMeditation(await fetchPage(RUSSIAN_SOURCE_URL));
+        if (!isCurrentRussianDate(meditation.date, today)) {
+          notUpdated.russian = meditation.date;
+          return;
+        }
+        await saveDailyCache(env, "russian", today.key, meditation.date, meditation);
+        cache.russian = { sourceDate: meditation.date, payload: meditation };
+      } catch (error) {
+        errors.russian = error;
+      }
+    })());
+  }
+
+  if (requested.spiritual && !cache.spiritual) {
+    tasks.push((async () => {
+      try {
+        const principle = parseSpiritualPrinciple(
+          await fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
+        );
+        if (!isCurrentEnglishDate(principle.date, today)) {
+          notUpdated.spiritual = principle.date;
+          console.log(JSON.stringify({
+            event: "spiritual_date_mismatch",
+            source_date: principle.date,
+            today_key: today.key,
+            today_hour: today.hour
+          }));
+          return;
+        }
+        const payload = splitDailyText(await translateToRussian(env, principle.raw));
+        await saveDailyCache(env, "spiritual", today.key, principle.date, payload);
+        cache.spiritual = { sourceDate: principle.date, payload };
+      } catch (error) {
+        errors.spiritual = error;
+      }
+    })());
+  }
+
+  await Promise.all(tasks);
+  return { ...cache, errors, notUpdated };
+}
+
+export async function getDailyCache(env, today = getBishkekDate()) {
+  const result = await env.DB.prepare(
+    "SELECT content_type, source_date, payload FROM daily_cache WHERE date_key = ?"
+  ).bind(today.key).all();
+  const cache = {};
+  for (const row of result.results) {
+    const isCurrent = row.content_type === "russian"
+      ? isCurrentRussianDate(row.source_date, today)
+      : row.content_type === "spiritual" && isCurrentEnglishDate(row.source_date, today);
+    if (!isCurrent) continue;
+    try {
+      cache[row.content_type] = {
+        sourceDate: row.source_date,
+        payload: JSON.parse(row.payload)
+      };
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "daily_cache_invalid",
+        content_type: row.content_type,
+        date_key: today.key,
+        error: String(error)
+      }));
+    }
+  }
+  return cache;
+}
+
+async function saveDailyCache(env, contentType, dateKey, sourceDate, payload) {
+  await env.DB.prepare(`
+    INSERT INTO daily_cache (content_type, date_key, source_date, payload)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(content_type, date_key) DO UPDATE SET
+      source_date = excluded.source_date,
+      payload = excluded.payload,
+      created_at = CURRENT_TIMESTAMP
+  `).bind(contentType, dateKey, sourceDate, JSON.stringify(payload)).run();
 }
 
 export async function processSpiritualDaily(env, html, today, subscribers) {
@@ -347,21 +441,20 @@ function isInactiveRecipientError(error) {
   return /bot was blocked|chat not found|user is deactivated|bot was kicked/i.test(String(error));
 }
 
-async function sendDailyPreview(env, chatId) {
-  try {
-    const [russianHtml, spiritualHtml] = await Promise.all([
-      fetchPage(RUSSIAN_SOURCE_URL),
-      fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
-    ]);
-    const russianMeditation = parseRussianMeditation(russianHtml);
-    const spiritualPrinciple = parseSpiritualPrinciple(spiritualHtml);
-    await sendDailyPost(env, chatId, "ЕЖЕДНЕВНИК", russianMeditation);
-    const translation = await translateToRussian(env, spiritualPrinciple.raw);
-    await sendDailyPost(env, chatId, "ДУХОВНЫЕ ПРИНЦИПЫ", splitDailyText(translation));
-  } catch (error) {
-    console.error(JSON.stringify({ event: "daily_preview_failed", error: String(error) }));
-    await sendMessage(env, chatId, `⚠️ Ежедневные тексты не подготовлены: ${String(error).slice(0, 1000)}`);
+async function sendDailyPreviewFromCache(env, chatId, today) {
+  const cache = await getDailyCache(env, today);
+  const missing = [];
+  if (cache.russian) {
+    await sendDailyPost(env, chatId, "ЕЖЕДНЕВНИК", cache.russian.payload);
+  } else {
+    missing.push("Ежедневник");
   }
+  if (cache.spiritual) {
+    await sendDailyPost(env, chatId, "ДУХОВНЫЕ ПРИНЦИПЫ", cache.spiritual.payload);
+  } else {
+    missing.push("Духовные принципы");
+  }
+  return { missing };
 }
 
 async function fetchPage(url, { bypassCache = false } = {}) {
@@ -447,30 +540,6 @@ function splitDailyText(text) {
 function extractFirst(value, pattern) {
   const match = pattern.exec(value);
   return match ? htmlToText(match[1]) : "";
-}
-
-async function translateToRussian(env, text) {
-  if (!env.GEMINI_API_KEY) throw new Error("В Cloudflare не найден секрет GEMINI_API_KEY");
-  const input = [
-    "Переведи приведённый ниже текст с английского на русский.",
-    "Переведи весь текст без сокращений, пересказа, комментариев и добавлений.",
-    "Сохраняй абзацы, даты, цитаты, названия литературы и терминологию Анонимных Наркоманов.",
-    "Верни только готовый русский перевод.",
-    "",
-    text
-  ].join("\n");
-  const response = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-    body: JSON.stringify({ model: GEMINI_MODEL, input })
-  });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(`Gemini API: ${payload.error?.message || response.status}`);
-  const translation = payload.steps?.filter((step) => step.type === "model_output")
-    .flatMap((step) => step.content || []).filter((item) => item.type === "text")
-    .map((item) => item.text).join("").trim();
-  if (!translation) throw new Error("Gemini не вернул текст перевода");
-  return translation;
 }
 
 function htmlToText(value) {

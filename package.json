@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/index.js && node --check src/schedule-fix.js && node --check src/daily-gemini.js",
+    "check": "node --check src/index.js && node --check src/schedule-fix.js && node --check src/daily-gemini.js && node --check src/translate.js",
     "build": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
     "test": "node --test test/*.test.js",
     "test:live": "node --test test/live/spadna.test.js"
