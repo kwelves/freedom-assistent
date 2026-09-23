@@ -1,5 +1,5 @@
 import worker from "./schedule-fix.js";
-import { translateToRussian } from "./translate.js";
+import { translateForDaily, translateToRussian } from "./translate.js";
 
 export const DAILY_CRONS = ["*/15 3-7 * * *", "0 8 * * *"];
 export const DAILY_PREPARE_CRON = "55 2 * * *";
@@ -22,14 +22,17 @@ export default {
 
     if (command === "/daily" && isOwner) {
       const today = getBishkekDate();
-      const result = await sendDailyPreviewFromCache(env, message.chat.id, today);
-      if (result.missing.length) {
+      try {
+        const prepared = await prepareDailyCache(env, today);
+        await sendDailyPreviewFromCache(env, message.chat.id, today);
+        const report = describeDailyProblems(today, prepared);
+        if (report) await sendMessage(env, message.chat.id, report);
+      } catch (error) {
         await sendMessage(
           env,
           message.chat.id,
-          `⌛ Материалы за ${today.key} ещё не готовы: ${result.missing.join(", ")}. Готовлю кеш в фоне.`
+          `⚠️ Команда /daily сломалась.\nГде: подготовка или отправка текста.\nЧто случилось: ${String(error).slice(0, 500)}`
         );
-        ctx.waitUntil(prepareDailyCache(env, today));
       }
       return new Response("OK");
     }
@@ -74,6 +77,7 @@ export async function checkScheduledDaily(env, today = getBishkekDate()) {
 
 export async function runDailyBroadcast(env, { force = false, notifyRussianStale = false, today = getBishkekDate() } = {}) {
   const subscribers = await getActiveSubscribers(env);
+  const recipients = includeOwner(subscribers, env);
   const summary = {
     activeSubscribers: subscribers.length,
     force,
@@ -81,26 +85,27 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
     spiritual: createMaterialSummary(),
     deactivated: 0
   };
-  if (!subscribers.length) return summary;
+  if (!recipients.length) return summary;
 
   const deactivatedChatIds = new Set();
-  let pendingRussian = subscribers;
-  let pendingSpiritual = subscribers;
+  const deliveryProblems = [];
+  let pendingRussian = recipients;
+  let pendingSpiritual = recipients;
   if (!force) {
     [pendingRussian, pendingSpiritual] = await Promise.all([
-      getPendingSubscribers(env, "russian", today.key, subscribers),
-      getPendingSubscribers(env, "spiritual", today.key, subscribers)
+      getPendingSubscribers(env, "russian", today.key, recipients),
+      getPendingSubscribers(env, "spiritual", today.key, recipients)
     ]);
     if (!pendingRussian.length && !pendingSpiritual.length) {
-      summary.russian.skipped = subscribers.length;
-      summary.spiritual.skipped = subscribers.length;
+      summary.russian.skipped = recipients.length;
+      summary.spiritual.skipped = recipients.length;
       return summary;
     }
   }
 
   const shouldFetchRussian = force || pendingRussian.length > 0;
   const shouldFetchSpiritual = force || pendingSpiritual.length > 0;
-  let cache;
+  let cache = { errors: {}, notUpdated: {}, translation: null };
   try {
     cache = await prepareDailyCache(env, today, {
       russian: shouldFetchRussian,
@@ -109,11 +114,16 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
   } catch (error) {
     if (shouldFetchRussian) markMaterialError(summary.russian, error);
     if (shouldFetchSpiritual) markMaterialError(summary.spiritual, error);
+    cache.errors = {
+      ...(shouldFetchRussian ? { russian: error } : {}),
+      ...(shouldFetchSpiritual ? { spiritual: error } : {})
+    };
+    await reportDailyProblems(env, today, { ...cache, sendFailures: deliveryProblems });
     return summary;
   }
 
   if (!shouldFetchRussian) {
-    summary.russian.skipped = subscribers.length;
+    summary.russian.skipped = recipients.length;
   } else if (cache.errors.russian) {
     markMaterialError(summary.russian, cache.errors.russian);
   } else if (!cache.russian) {
@@ -128,13 +138,13 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
       today.key,
       "ЕЖЕДНЕВНИК",
       cache.russian.payload,
-      subscribers,
-      { force, deactivatedChatIds }
+      recipients,
+      { force, deactivatedChatIds, deliveryProblems }
     ));
   }
 
   if (!shouldFetchSpiritual) {
-    summary.spiritual.skipped = subscribers.length;
+    summary.spiritual.skipped = recipients.length;
   } else if (cache.errors.spiritual) {
     markMaterialError(summary.spiritual, cache.errors.spiritual);
   } else if (!cache.spiritual) {
@@ -147,10 +157,10 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
       } : {})
     });
   } else {
-    const pendingSubscribers = (force ? subscribers : pendingSpiritual)
+    const pendingSubscribers = (force ? recipients : pendingSpiritual)
       .filter((chatId) => !deactivatedChatIds.has(chatId));
     if (!pendingSubscribers.length) {
-      summary.spiritual.skipped = subscribers.length - deactivatedChatIds.size;
+      summary.spiritual.skipped = recipients.length - deactivatedChatIds.size;
     } else {
       Object.assign(summary.spiritual, await sendDailyToSubscribers(
         env,
@@ -158,14 +168,112 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
         today.key,
         "ДУХОВНЫЕ ПРИНЦИПЫ",
         cache.spiritual.payload,
-        subscribers,
-        { force, deactivatedChatIds }
+        recipients,
+        { force, deactivatedChatIds, deliveryProblems }
       ));
     }
   }
 
   summary.deactivated = deactivatedChatIds.size;
+  await reportDailyProblems(env, today, { ...cache, sendFailures: deliveryProblems });
   return summary;
+}
+
+function includeOwner(subscribers, env) {
+  const ownerId = String(env.OWNER_ID || "").trim();
+  if (!ownerId || subscribers.some((chatId) => String(chatId) === ownerId)) return subscribers;
+  return [...subscribers, ownerId];
+}
+
+export function describeDailyProblems(today, prepared = {}) {
+  const blocks = [];
+  if (prepared.errors?.russian) {
+    blocks.push([
+      "Ежедневник не подготовлен.",
+      "Где сломалось: чтение сайта na-russia.org.",
+      `Что случилось: ${cleanError(prepared.errors.russian)}`
+    ].join("\n"));
+  } else if (prepared.notUpdated?.russian) {
+    blocks.push([
+      "Ежедневник не отправлен.",
+      "Где сломалось: дата на сайте na-russia.org.",
+      `На сайте: ${prepared.notUpdated.russian}. Сегодня: ${today.day}.${today.month}.${today.year}.`
+    ].join("\n"));
+  }
+
+  const translation = prepared.translation;
+  if (prepared.errors?.spiritual) {
+    blocks.push([
+      "Духовные принципы не подготовлены.",
+      "Где сломалось: источник или перевод.",
+      `Что случилось: ${cleanError(prepared.errors.spiritual)}`,
+      formatTranslationChain(translation)
+    ].filter(Boolean).join("\n"));
+  } else if (prepared.notUpdated?.spiritual) {
+    blocks.push([
+      "Духовные принципы не отправлены.",
+      "Где сломалось: дата на сайте na.org.",
+      `На сайте: ${prepared.notUpdated.spiritual}. Сегодня: ${today.key}.`
+    ].join("\n"));
+  } else if (translation?.failures?.length) {
+    blocks.push([
+      `Духовные принципы переведены через ${providerLabel(translation.provider)}, не с первой попытки.`,
+      "Где в цепочке была проблема:",
+      formatTranslationChain(translation)
+    ].join("\n"));
+  }
+
+  for (const failure of prepared.sendFailures || []) blocks.push(failure);
+  if (!blocks.length) return "";
+  return [`⚠️ Отчёт за ${today.key}`, ...blocks].join("\n\n");
+}
+
+async function reportDailyProblems(env, today, prepared) {
+  const text = describeDailyProblems(today, prepared);
+  if (!text || !env.OWNER_ID) return;
+  const marker = `owner-report:${today.key}:${reportKey(text)}`;
+  const inserted = await env.DB.prepare(
+    "INSERT OR IGNORE INTO sent_reminders (reminder_key) VALUES (?)"
+  ).bind(marker).run();
+  if (!inserted.meta.changes) return;
+  try {
+    await sendMessage(env, env.OWNER_ID, text);
+  } catch (error) {
+    await env.DB.prepare("DELETE FROM sent_reminders WHERE reminder_key = ?").bind(marker).run();
+    console.error(JSON.stringify({ event: "owner_report_failed", error: String(error) }));
+  }
+}
+
+function formatTranslationChain(translation) {
+  if (!translation) return "";
+  const lines = [];
+  let step = 1;
+  for (const failure of translation.failures || []) {
+    lines.push(`${step}. ${providerLabel(failure.provider)} — ошибка: ${cleanError(failure.error)}`);
+    step += 1;
+  }
+  for (const provider of translation.skipped || []) {
+    lines.push(`${step}. ${providerLabel(provider)} — пропущен, нет доступа`);
+    step += 1;
+  }
+  if (translation.provider) {
+    lines.push(`${step}. ${providerLabel(translation.provider)} — получилось`);
+  }
+  return lines.join("\n");
+}
+
+function providerLabel(provider) {
+  return { "workers-ai": "Cloudflare", groq: "Groq", gemini: "Gemini" }[provider] || provider || "неизвестно";
+}
+
+function cleanError(error) {
+  return String(error).replace(/^Error:\s*/, "").slice(0, 300);
+}
+
+function reportKey(text) {
+  let value = 0;
+  for (const char of text) value = (value * 33 + char.codePointAt(0)) >>> 0;
+  return value.toString(16);
 }
 
 function createMaterialSummary() {
@@ -218,6 +326,7 @@ export async function prepareDailyCache(
   const errors = {};
   const notUpdated = {};
   const tasks = [];
+  let translation = null;
 
   if (requested.russian && !cache.russian) {
     tasks.push((async () => {
@@ -251,17 +360,24 @@ export async function prepareDailyCache(
           }));
           return;
         }
-        const payload = splitDailyText(await translateToRussian(env, principle.raw));
+        const translated = await translateForDaily(env, principle.raw);
+        translation = translated;
+        const payload = splitDailyText(translated.text);
         await saveDailyCache(env, "spiritual", today.key, principle.date, payload);
         cache.spiritual = { sourceDate: principle.date, payload };
       } catch (error) {
         errors.spiritual = error;
+        translation = {
+          provider: null,
+          failures: error.failures || [],
+          skipped: error.skipped || []
+        };
       }
     })());
   }
 
   await Promise.all(tasks);
-  return { ...cache, errors, notUpdated };
+  return { ...cache, errors, notUpdated, translation };
 }
 
 export async function getDailyCache(env, today = getBishkekDate()) {
@@ -399,7 +515,7 @@ export async function sendDailyToSubscribers(
   heading,
   content,
   subscribers,
-  { force = false, deactivatedChatIds = new Set() } = {}
+  { force = false, deactivatedChatIds = new Set(), deliveryProblems = [] } = {}
 ) {
   const stats = { sent: 0, skipped: 0, errors: 0 };
   for (const chatId of subscribers) {
@@ -423,6 +539,7 @@ export async function sendDailyToSubscribers(
       stats.sent += 1;
     } catch (error) {
       stats.errors += 1;
+      deliveryProblems.push(`${heading} не дошёл в чат ${chatId}: ${String(error).replace(/^Error:\s*/, "").slice(0, 180)}`);
       console.error(JSON.stringify({ event: "daily_recipient_failed", chat_id: chatId, error: String(error) }));
       if (isInactiveRecipientError(error)) {
         deactivatedChatIds.add(chatId);

@@ -12,16 +12,27 @@ const INSTRUCTIONS = [
   "Верни только готовый русский перевод."
 ].join("\n");
 
+const PROVIDER_ORDER = ["workers-ai", "groq", "gemini"];
+
 export async function translateToRussian(env, text) {
-  const errors = [];
-  for (const provider of configuredProviders(env)) {
+  return (await translateForDaily(env, text)).text;
+}
+
+export async function translateForDaily(env, text) {
+  const failures = [];
+  const skipped = [];
+  for (const provider of PROVIDER_ORDER) {
+    if (!providerReady(provider, env)) {
+      skipped.push(provider);
+      continue;
+    }
     try {
       const translation = await translateWith(provider, env, text);
       if (!translation) throw new Error("пустой ответ");
       console.log(JSON.stringify({ event: "translation_ready", provider }));
-      return translation;
+      return { text: translation, provider, failures, skipped };
     } catch (error) {
-      errors.push(`${provider}: ${String(error).slice(0, 180)}`);
+      failures.push({ provider, error: String(error).slice(0, 180) });
       console.error(JSON.stringify({
         event: "translation_provider_failed",
         provider,
@@ -29,17 +40,18 @@ export async function translateToRussian(env, text) {
       }));
     }
   }
-  throw new Error(errors.length
-    ? `Перевод недоступен. ${errors.join(" | ")}`
+  const error = new Error(failures.length
+    ? `Перевод недоступен. ${failures.map((item) => `${item.provider}: ${item.error}`).join(" | ")}`
     : "Не настроен ни один API перевода");
+  error.failures = failures;
+  error.skipped = skipped;
+  throw error;
 }
 
-function configuredProviders(env) {
-  const providers = [];
-  if (typeof env.AI?.run === "function") providers.push("workers-ai");
-  if (env.GROQ_API_KEY) providers.push("groq");
-  if (env.GEMINI_API_KEY) providers.push("gemini");
-  return providers;
+function providerReady(provider, env) {
+  if (provider === "workers-ai") return typeof env.AI?.run === "function";
+  if (provider === "groq") return Boolean(env.GROQ_API_KEY);
+  return Boolean(env.GEMINI_API_KEY);
 }
 
 function translateWith(provider, env, text) {

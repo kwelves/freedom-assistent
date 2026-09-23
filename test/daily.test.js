@@ -500,12 +500,12 @@ test("owner broadcast command sends a summary report to OWNER_ID", async (t) => 
   }, { waitUntil() { throw new Error("waitUntil must not be used"); } });
 
   assert.equal(response.status, 200);
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].chat_id, "77");
-  assert.match(sent[0].text, /daily_for_all/);
-  assert.match(sent[0].text, /Active subscribers: 0/);
-  assert.match(sent[0].text, /Ежедневник/);
-  assert.match(sent[0].text, /Духовные принципы/);
+  const summary = sent.find((message) => message.text?.includes("daily_for_all"));
+  assert.equal(summary.chat_id, "77");
+  assert.match(summary.text, /Active subscribers: 0/);
+  assert.match(summary.text, /Ежедневник/);
+  assert.match(summary.text, /Духовные принципы/);
+  assert.equal(sent.filter((message) => message.text?.startsWith("⚠️ Отчёт")).length, 1);
 });
 
 test("duplicate /daily_force_all update_id runs the broadcast only once", async (t) => {
@@ -618,10 +618,11 @@ test("Daily Cron handler remains explicitly configured for silent normal mode", 
   assert.equal(getBishkekDate(new Date("2026-09-08T03:00:00Z")).hour, 9);
 });
 
-test("scheduled stale Russian source does not send an OWNER notification", async (t) => {
+test("scheduled stale Russian source tells the owner once and still sends the owner any missing material", async (t) => {
   const db = new FakeDB();
   db.subscribers.set(1, { chat_id: 1, active: 1 });
   db.markers.add("daily:spiritual:2026-09-08:1");
+  db.markers.add("daily:spiritual:2026-09-08:77");
   const sourceRequests = [];
   const telegramMessages = [];
   t.mock.method(globalThis, "fetch", async (url, options = {}) => {
@@ -642,14 +643,86 @@ test("scheduled stale Russian source does not send an OWNER notification", async
     }
     throw new Error(`Unexpected fetch: ${target}`);
   });
+  const env = { DB: db, BOT_TOKEN: "test", OWNER_ID: "77" };
 
-  await checkScheduledDaily(
-    { DB: db, BOT_TOKEN: "test", OWNER_ID: "77" },
-    { ...broadcastToday, minute: 15 }
+  await checkScheduledDaily(env, { ...broadcastToday, minute: 15 });
+  await checkScheduledDaily(env, { ...broadcastToday, minute: 30 });
+
+  assert.deepEqual(sourceRequests, ["https://na-russia.org/", "https://na-russia.org/"]);
+  assert.equal(telegramMessages.length, 1);
+  assert.equal(telegramMessages[0].chat_id, "77");
+  assert.match(telegramMessages[0].text, /Ежедневник не отправлен/);
+  assert.match(telegramMessages[0].text, /na-russia.org/);
+  assert.match(telegramMessages[0].text, /7 сентября/);
+});
+
+test("a broken translator is reported to the owner once, with the place in the chain", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  db.markers.add("daily:russian:2026-09-08:1");
+  db.markers.add("daily:russian:2026-09-08:77");
+  const sent = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    const target = String(url);
+    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
+    if (target === "https://api.groq.com/openai/v1/chat/completions") {
+      return new Response(JSON.stringify({ error: { message: "rate limit" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
+      return new Response(JSON.stringify({
+        steps: [{ type: "model_output", content: [{ type: "text", text: "8 сентября 2026\nПереведённая тема\nПереведённый текст" }] }]
+      }), { headers: { "content-type": "application/json" } });
+    }
+    if (target.startsWith("https://api.telegram.org/bot")) {
+      sent.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: sent.length } }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch: ${target}`);
+  });
+  const env = {
+    DB: db,
+    BOT_TOKEN: "test",
+    OWNER_ID: "77",
+    GROQ_API_KEY: "groq",
+    GEMINI_API_KEY: "gemini",
+    AI: { async run() { throw new Error("занят"); } }
+  };
+
+  await runDailyBroadcast(env, { force: false, today: broadcastToday });
+  await runDailyBroadcast(env, { force: false, today: broadcastToday });
+
+  const reports = sent.filter((message) => message.text?.includes("Отчёт"));
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].chat_id, "77");
+  assert.match(reports[0].text, /Cloudflare — ошибка/);
+  assert.match(reports[0].text, /Groq — ошибка/);
+  assert.match(reports[0].text, /Gemini — получилось/);
+  assert.equal(sent.filter((message) => message.text?.includes("ДУХОВНЫЕ ПРИНЦИПЫ")).length, 2);
+});
+
+test("owner receives today's daily when subscribers already have both texts", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  db.markers.add("daily:russian:2026-09-08:1");
+  db.markers.add("daily:spiritual:2026-09-08:1");
+  const sent = [];
+  t.mock.method(globalThis, "fetch", dailySourcesFetch(sent));
+
+  await runDailyBroadcast(
+    { DB: db, BOT_TOKEN: "test", OWNER_ID: "77", GEMINI_API_KEY: "test" },
+    { force: false, today: broadcastToday }
   );
 
-  assert.deepEqual(sourceRequests, ["https://na-russia.org/"]);
-  assert.deepEqual(telegramMessages, []);
+  assert.deepEqual(sent.map((message) => String(message.chat_id)), ["77", "77"]);
+  assert.match(sent[0].text, /ЕЖЕДНЕВНИК/);
+  assert.match(sent[1].text, /ДУХОВНЫЕ ПРИНЦИПЫ/);
+  assert.equal(db.markers.has("daily:russian:2026-09-08:77"), true);
+  assert.equal(db.markers.has("daily:spiritual:2026-09-08:77"), true);
 });
 
 test("scheduled recognizes both Daily Cron expressions", async () => {
