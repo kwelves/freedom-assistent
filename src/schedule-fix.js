@@ -6,7 +6,7 @@ export default {
   },
 
   scheduled(controller, env, ctx) {
-    const cron = controller.cron === "0 13 * * THU" ? "0 13 * * MON,THU" : controller.cron;
-    return worker.scheduled({ cron, scheduledTime: controller.scheduledTime }, env, ctx);
+    if (controller.cron === "0 13 * * THU") return;
+    return worker.scheduled(controller, env, ctx);
   }
 };
