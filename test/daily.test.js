@@ -226,7 +226,7 @@ test("a saved source that does not open falls back to the original address", asy
 
 test("an unrecognized page on a new address reports the move and the unfamiliar layout", async (t) => {
   const db = new FakeDB();
-  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+  t.mock.method(globalThis, "fetch", async (url) => {
     if (String(url) === "https://na-russia.org/") return pageResponse("<html>пусто</html>", "https://new-daily.example/");
     if (String(url).startsWith("https://api.telegram.org/bot")) {
       return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
