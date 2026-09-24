@@ -24,7 +24,7 @@ head_sampling_rate = 1
 binding = "AI"
 
 [triggers]
-crons = ["55 2 * * *", "*/15 3-7 * * *", "0 8 * * *", "0 11 * * SAT", "0 13 * * THU"]
+crons = ["55 2 * * *", "*/15 3-7 * * *", "0 8 * * *", "0 11 * * SAT"]
 
 [[d1_databases]]
 binding = "DB"

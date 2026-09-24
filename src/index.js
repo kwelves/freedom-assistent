@@ -46,8 +46,7 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    const meetingTime = controller.cron === "0 13 * * MON,THU" ? "21:00" : "19:00";
-    ctx.waitUntil(sendScheduledReminder(env, meetingTime, controller.scheduledTime));
+    ctx.waitUntil(sendScheduledReminder(env, "19:00", controller.scheduledTime));
   }
 };
 

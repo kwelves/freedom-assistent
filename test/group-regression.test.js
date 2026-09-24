@@ -22,22 +22,27 @@ test("new_chat_members still records username and sends a welcome reply", async 
   assert.equal(sent[0].reply_parameters.message_id, 20);
 });
 
-test("Thursday and Saturday Group reminders keep their existing meeting times", async (t) => {
+test("Saturday group reminder stays and Thursday reminder is not sent", async (t) => {
   const sent = [];
   t.mock.method(globalThis, "fetch", telegramFetch(sent));
+  const saturdayWaits = [];
+  worker.scheduled(
+    { cron: "0 11 * * SAT", scheduledTime: Date.UTC(2026, 8, 12, 11) },
+    { DB: new FakeDB(), BOT_TOKEN: "test", CHAT_ID: -10001 },
+    { waitUntil(promise) { saturdayWaits.push(promise); } }
+  );
+  await Promise.all(saturdayWaits);
+  assert.match(sent.at(-1).text, /19:00/);
+  assert.equal(sent.at(-1).chat_id, -10001);
 
-  for (const [cron, expectedTime, scheduledTime] of [
-    ["0 13 * * THU", "21:00", Date.UTC(2026, 8, 10, 13)],
-    ["0 11 * * SAT", "19:00", Date.UTC(2026, 8, 12, 11)]
-  ]) {
-    const waits = [];
-    worker.scheduled(
-      { cron, scheduledTime },
-      { DB: new FakeDB(), BOT_TOKEN: "test", CHAT_ID: -10001 },
-      { waitUntil(promise) { waits.push(promise); } }
-    );
-    await Promise.all(waits);
-    assert.match(sent.at(-1).text, new RegExp(expectedTime.replace(":", "\\:")));
-    assert.equal(sent.at(-1).chat_id, -10001);
-  }
+  const beforeThursday = sent.length;
+  const thursdayWaits = [];
+  worker.scheduled(
+    { cron: "0 13 * * THU", scheduledTime: Date.UTC(2026, 8, 10, 13) },
+    { DB: new FakeDB(), BOT_TOKEN: "test", CHAT_ID: -10001 },
+    { waitUntil(promise) { thursdayWaits.push(promise); } }
+  );
+  await Promise.all(thursdayWaits);
+  assert.equal(thursdayWaits.length, 0);
+  assert.equal(sent.length, beforeThursday);
 });

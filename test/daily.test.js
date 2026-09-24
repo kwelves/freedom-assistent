@@ -832,7 +832,7 @@ test("/daily sends today's cached materials without source or model calls", asyn
   assert.equal(previewDb.markers.size, 0);
 });
 
-test("Daily, Saturday and Thursday Cron expressions remain configured", async () => {
+test("Daily and Saturday Cron expressions remain configured without Thursday", async () => {
   const config = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
   assert.deepEqual(DAILY_CRONS, ["*/15 3-7 * * *", "0 8 * * *"]);
   assert.equal(DAILY_PREPARE_CRON, "55 2 * * *");
@@ -841,5 +841,5 @@ test("Daily, Saturday and Thursday Cron expressions remain configured", async ()
   assert.match(config, /"0 8 \* \* \*"/);
   assert.doesNotMatch(config, /"\*\/15 3-17 \* \* \*"/);
   assert.match(config, /"0 11 \* \* SAT"/);
-  assert.match(config, /"0 13 \* \* THU"/);
+  assert.doesNotMatch(config, /THU/);
 });
