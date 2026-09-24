@@ -3,6 +3,8 @@ export class FakeDB {
     this.subscribers = new Map();
     this.markers = new Set();
     this.usernames = new Set();
+    this.dailyCache = new Map();
+    this.settings = new Map();
   }
 
   prepare(sql) {
@@ -18,9 +20,20 @@ export class FakeDB {
         if (normalized.startsWith("SELECT 1 FROM sent_reminders")) {
           return db.markers.has(String(values[0])) ? { 1: 1 } : null;
         }
+        if (normalized.startsWith("SELECT value FROM settings")) {
+          const value = db.settings.get(String(values[0]));
+          return value === undefined ? null : { value };
+        }
         return null;
       },
       async all() {
+        if (normalized.startsWith("SELECT content_type, source_date, payload FROM daily_cache")) {
+          return {
+            results: [...db.dailyCache.values()]
+              .filter((row) => row.date_key === values[0])
+              .map(({ content_type, source_date, payload }) => ({ content_type, source_date, payload }))
+          };
+        }
         if (normalized.startsWith("SELECT chat_id FROM subscribers")) {
           return { results: [...db.subscribers.values()].filter((row) => row.active === 1).map(({ chat_id }) => ({ chat_id })) };
         }
@@ -30,6 +43,20 @@ export class FakeDB {
         return { results: [] };
       },
       async run() {
+        if (normalized.startsWith("INSERT INTO settings")) {
+          db.settings.set(String(values[0]), String(values[1]));
+          return { meta: { changes: 1 } };
+        }
+        if (normalized.startsWith("INSERT INTO daily_cache")) {
+          const [content_type, date_key, source_date, payload] = values;
+          db.dailyCache.set(`${content_type}:${date_key}`, {
+            content_type,
+            date_key,
+            source_date,
+            payload
+          });
+          return { meta: { changes: 1 } };
+        }
         if (normalized.startsWith("INSERT INTO subscribers")) {
           const [chat_id, username, first_name, created_at] = values;
           const previous = db.subscribers.get(chat_id);
