@@ -160,6 +160,92 @@ test("spadna requests use the Bishkek timezone and bypass cache without changing
   assert.equal("cache" in sourceRequests.get("https://na-russia.org/"), false);
 });
 
+function pageResponse(body, finalUrl, status = 200) {
+  const response = new Response(body, { status });
+  Object.defineProperty(response, "url", { value: finalUrl });
+  return response;
+}
+
+test("a moved source is remembered, reported once, and opened directly next time", async (t) => {
+  const db = new FakeDB();
+  const sent = [];
+  const requested = [];
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    const target = String(url);
+    requested.push(target);
+    if (target === "https://na-russia.org/") {
+      return pageResponse(russianPreviewFixture, "https://new-daily.example/today");
+    }
+    if (target === "https://new-daily.example/today") return pageResponse(russianPreviewFixture, target);
+    if (target.startsWith("https://api.telegram.org/bot")) {
+      sent.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: sent.length } }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch: ${target}`);
+  });
+  const env = { DB: db, BOT_TOKEN: "test", OWNER_ID: "77" };
+
+  await prepareDailyCache(env, broadcastToday, { russian: true, spiritual: false });
+  db.dailyCache.clear();
+  await prepareDailyCache(env, broadcastToday, { russian: true, spiritual: false });
+
+  assert.deepEqual(requested.filter((url) => !url.includes("api.telegram.org")), [
+    "https://na-russia.org/",
+    "https://new-daily.example/today"
+  ]);
+  assert.equal(db.settings.get("source_url:russian"), "https://new-daily.example/today");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].chat_id, "77");
+  assert.match(sent[0].text, /Сайт переехал/);
+  assert.match(sent[0].text, /https:\/\/new-daily\.example\/today/);
+});
+
+test("a saved source that does not open falls back to the original address", async (t) => {
+  const db = new FakeDB();
+  db.settings.set("source_url:russian", "https://broken.example/");
+  const requested = [];
+  t.mock.method(globalThis, "fetch", async (url) => {
+    const target = String(url);
+    requested.push(target);
+    if (target === "https://broken.example/") return new Response("missing", { status: 404 });
+    if (target === "https://na-russia.org/") return pageResponse(russianPreviewFixture, target);
+    throw new Error(`Unexpected fetch: ${target}`);
+  });
+
+  const cache = await prepareDailyCache(
+    { DB: db, BOT_TOKEN: "test" },
+    broadcastToday,
+    { russian: true, spiritual: false }
+  );
+
+  assert.deepEqual(requested, ["https://broken.example/", "https://na-russia.org/"]);
+  assert.equal(cache.russian.payload.title, "Тема дня");
+});
+
+test("an unrecognized page on a new address reports the move and the unfamiliar layout", async (t) => {
+  const db = new FakeDB();
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    if (String(url) === "https://na-russia.org/") return pageResponse("<html>пусто</html>", "https://new-daily.example/");
+    if (String(url).startsWith("https://api.telegram.org/bot")) {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+
+  const cache = await prepareDailyCache(
+    { DB: db, BOT_TOKEN: "test", OWNER_ID: "77" },
+    broadcastToday,
+    { russian: true, spiritual: false }
+  );
+
+  assert.match(String(cache.errors.russian), /новом адресе: https:\/\/new-daily\.example\//);
+  assert.match(String(cache.errors.russian), /Вид страницы незнакомый/);
+});
+
 test("daily preparation translates once and reuses today's D1 cache", async (t) => {
   const db = new FakeDB();
   const sent = [];

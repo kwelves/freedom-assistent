@@ -221,8 +221,10 @@ export async function prepareDailyCache(
 
   if (requested.russian && !cache.russian) {
     tasks.push((async () => {
+      let page;
       try {
-        const meditation = parseRussianMeditation(await fetchPage(RUSSIAN_SOURCE_URL));
+        page = await loadSourcePage(env, "russian");
+        const meditation = parseRussianMeditation(page.html);
         if (!isCurrentRussianDate(meditation.date, today)) {
           notUpdated.russian = meditation.date;
           return;
@@ -230,17 +232,17 @@ export async function prepareDailyCache(
         await saveDailyCache(env, "russian", today.key, meditation.date, meditation);
         cache.russian = { sourceDate: meditation.date, payload: meditation };
       } catch (error) {
-        errors.russian = error;
+        errors.russian = pageError(error, page);
       }
     })());
   }
 
   if (requested.spiritual && !cache.spiritual) {
     tasks.push((async () => {
+      let page;
       try {
-        const principle = parseSpiritualPrinciple(
-          await fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
-        );
+        page = await loadSourcePage(env, "spiritual", { bypassCache: true });
+        const principle = parseSpiritualPrinciple(page.html);
         if (!isCurrentEnglishDate(principle.date, today)) {
           notUpdated.spiritual = principle.date;
           console.log(JSON.stringify({
@@ -255,7 +257,7 @@ export async function prepareDailyCache(
         await saveDailyCache(env, "spiritual", today.key, principle.date, payload);
         cache.spiritual = { sourceDate: principle.date, payload };
       } catch (error) {
-        errors.spiritual = error;
+        errors.spiritual = pageError(error, page);
       }
     })());
   }
@@ -457,13 +459,84 @@ async function sendDailyPreviewFromCache(env, chatId, today) {
   return { missing };
 }
 
+const DEFAULT_SOURCE_URLS = {
+  russian: RUSSIAN_SOURCE_URL,
+  spiritual: SPIRITUAL_SOURCE_URL
+};
+
+export function siteName(url) {
+  return new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+}
+
+function sourceSettingKey(contentType) {
+  return `source_url:${contentType}`;
+}
+
+async function readSetting(env, key) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+  return row?.value || "";
+}
+
+async function writeSetting(env, key, value) {
+  await env.DB.prepare(`
+    INSERT INTO settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).bind(key, value).run();
+}
+
+function preserveTimeZone(finalUrl, requestedUrl) {
+  const final = new URL(finalUrl);
+  const requested = new URL(requestedUrl);
+  const timeZone = requested.searchParams.get("timeZone");
+  if (timeZone && !final.searchParams.has("timeZone")) final.searchParams.set("timeZone", timeZone);
+  return final.toString();
+}
+
+function pageError(error, page) {
+  if (!page?.moved) return error;
+  return new Error(`${error.message} Страница открылась на новом адресе: ${page.finalUrl}. Вид страницы незнакомый.`);
+}
+
+async function loadSourcePage(env, contentType, fetchOptions) {
+  const fallback = DEFAULT_SOURCE_URLS[contentType];
+  const saved = await readSetting(env, sourceSettingKey(contentType));
+  const candidates = [...new Set([saved || fallback, fallback])];
+  let lastError;
+  for (const url of candidates) {
+    try {
+      const page = await fetchPage(url, fetchOptions);
+      const finalUrl = preserveTimeZone(page.finalUrl || url, url);
+      const moved = siteName(url) !== siteName(finalUrl);
+      if (moved) await rememberMovedSource(env, contentType, url, finalUrl);
+      return { ...page, finalUrl, moved };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
+async function rememberMovedSource(env, contentType, fromUrl, finalUrl) {
+  await writeSetting(env, sourceSettingKey(contentType), finalUrl);
+  const noticeKey = `source_move_notified:${contentType}`;
+  if (await readSetting(env, noticeKey) === finalUrl) return;
+  console.log(JSON.stringify({ event: "source_moved", content_type: contentType, from: fromUrl, to: finalUrl }));
+  if (!env.OWNER_ID) return;
+  try {
+    await sendMessage(env, env.OWNER_ID, `Сайт переехал.\nРаньше: ${fromUrl}\nТеперь: ${finalUrl}\nДальше открою новый адрес.`);
+    await writeSetting(env, noticeKey, finalUrl);
+  } catch (error) {
+    console.error(JSON.stringify({ event: "source_move_notify_failed", content_type: contentType, error: String(error) }));
+  }
+}
+
 async function fetchPage(url, { bypassCache = false } = {}) {
   const response = await fetch(url, {
     ...(bypassCache ? { cache: "no-store" } : {}),
     headers: { "user-agent": "FreedomHelperBot/1.0" }
   });
   if (!response.ok) throw new Error(`Источник недоступен: ${url} (${response.status})`);
-  return response.text();
+  return { html: await response.text(), finalUrl: response.url || url };
 }
 
 function parseRussianMeditation(html) {
