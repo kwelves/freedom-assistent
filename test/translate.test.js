@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { prepareDailyCache } from "../src/daily-gemini.js";
+import { prepareDailyCache, SPIRITUAL_SOURCE_URL } from "../src/daily-gemini.js";
 import {
   GEMINI_MODELS,
   GROQ_MODEL,
@@ -139,7 +139,7 @@ test("daily cache stores one Workers AI translation and reuses it", async (t) =>
   t.mock.method(globalThis, "fetch", async (url) => {
     const target = String(url);
     if (target === "https://na-russia.org/") return new Response(russianFixture);
-    if (target.includes("spadna")) return new Response(currentSpadnaFixture);
+    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
     throw new Error(`Unexpected fetch: ${target}`);
   });
   const env = {

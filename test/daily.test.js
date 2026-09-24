@@ -133,7 +133,7 @@ test("English date parsing is explicit and deterministic", () => {
   assert.equal(isCurrentEnglishDate("not a date", today), false);
 });
 
-test("spadna requests use the Bishkek timezone and bypass cache without changing the Russian source request", async (t) => {
+test("spiritual source is spad.na.org and bypasses cache without changing the Russian source request", async (t) => {
   const db = new FakeDB();
   db.subscribers.set(1, { chat_id: 1, active: 1 });
   const sent = [];
@@ -152,10 +152,10 @@ test("spadna requests use the Bishkek timezone and bypass cache without changing
     { force: false, today: broadcastToday }
   );
 
-  assert.equal(SPIRITUAL_SOURCE_URL, "https://na.org/spadna/?timeZone=Asia%2FBishkek");
+  assert.equal(SPIRITUAL_SOURCE_URL, "https://spad.na.org/");
   const spiritualUrl = new URL(SPIRITUAL_SOURCE_URL);
-  assert.equal(`${spiritualUrl.origin}${spiritualUrl.pathname}`, "https://na.org/spadna/");
-  assert.equal(spiritualUrl.searchParams.get("timeZone"), "Asia/Bishkek");
+  assert.equal(`${spiritualUrl.origin}${spiritualUrl.pathname}`, "https://spad.na.org/");
+  assert.equal(spiritualUrl.search, "");
   assert.equal(sourceRequests.get(SPIRITUAL_SOURCE_URL).cache, "no-store");
   assert.equal("cache" in sourceRequests.get("https://na-russia.org/"), false);
 });

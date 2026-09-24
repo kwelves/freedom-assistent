@@ -4,11 +4,13 @@ import { translateForDaily, translateToRussian } from "./translate.js";
 export const DAILY_CRONS = ["*/15 3-7 * * *", "0 8 * * *"];
 export const DAILY_PREPARE_CRON = "55 2 * * *";
 const BISHKEK_TIME_ZONE = "Asia/Bishkek";
-const SPIRITUAL_TIME_ZONE = BISHKEK_TIME_ZONE;
 const DAILY_START_HOUR = 9;
 const DAILY_END_HOUR = 14;
 const RUSSIAN_SOURCE_URL = "https://na-russia.org/";
-export const SPIRITUAL_SOURCE_URL = `https://na.org/spadna/?timeZone=${encodeURIComponent(SPIRITUAL_TIME_ZONE)}`;
+// The old na.org/spadna page stays on yesterday. On spad.na.org the timeZone
+// query is ignored for Asia/Bishkek and also sticks on yesterday. The bare page
+// already shows the date that matches the Bishkek morning.
+export const SPIRITUAL_SOURCE_URL = "https://spad.na.org/";
 
 export default {
   async fetch(request, env, ctx) {
@@ -212,7 +214,7 @@ export function describeDailyProblems(today, prepared = {}) {
   } else if (prepared.notUpdated?.spiritual) {
     blocks.push([
       "Духовные принципы не отправлены.",
-      "Где сломалось: дата на сайте na.org.",
+      "Где сломалось: дата на сайте spad.na.org.",
       `На сайте: ${prepared.notUpdated.spiritual}. Сегодня: ${today.key}.`
     ].join("\n"));
   } else if (translation?.failures?.length) {
