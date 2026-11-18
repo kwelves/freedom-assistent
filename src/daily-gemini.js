@@ -1,5 +1,6 @@
-import worker from "./schedule-fix.js";
-import { translateForDaily, translateToRussian } from "./translate.js";
+import worker from "./index.js";
+import { escapeHtml, sendMessage } from "./telegram.js";
+import { translateForDaily } from "./translate.js";
 
 export const DAILY_CRONS = ["*/15 3-7 * * *", "0 8 * * *"];
 export const DAILY_PREPARE_CRON = "55 2 * * *";
@@ -7,10 +8,17 @@ const BISHKEK_TIME_ZONE = "Asia/Bishkek";
 const DAILY_START_HOUR = 9;
 const DAILY_END_HOUR = 14;
 const RUSSIAN_SOURCE_URL = "https://na-russia.org/";
-// The old na.org/spadna page stays on yesterday. On spad.na.org the timeZone
-// query is ignored for Asia/Bishkek and also sticks on yesterday. The bare page
-// already shows the date that matches the Bishkek morning.
-export const SPIRITUAL_SOURCE_URL = "https://spad.na.org/";
+// The front page of spad.na.org changes the day at midnight in the WordPress site
+// time zone (America/Los_Angeles): 14:00 Bishkek in winter, 13:00 in summer, plus
+// up to 10 minutes of Cloudflare cache. The timeZone query is ignored: on
+// 2026-11-18 at 10:08 UTC even ?timeZone=Pacific/Kiritimati showed November 18.
+// The page itself loads the text from this endpoint, which returns any date,
+// so we ask for the Bishkek date and the text is ready by 09:00.
+export const SPIRITUAL_SOURCE_URL = "https://spad.na.org/wp-json/naws-spad/v1/reading";
+
+export function spiritualSourceUrl(today) {
+  return `${SPIRITUAL_SOURCE_URL}?date=${today.key}`;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -70,14 +78,17 @@ export async function checkScheduledDaily(env, today = getBishkekDate()) {
     || today.hour > DAILY_END_HOUR
     || (today.hour === DAILY_END_HOUR && today.minute > 0)) return;
 
+  // A source may change its date later in the morning. An old date is only a
+  // problem if it is still there at the last check.
+  const isLastCheck = today.hour === DAILY_END_HOUR;
   try {
-    await runDailyBroadcast(env, { force: false, today });
+    await runDailyBroadcast(env, { force: false, today, reportNotUpdated: isLastCheck });
   } catch (error) {
     console.error(JSON.stringify({ event: "scheduled_daily_check_failed", error: String(error) }));
   }
 }
 
-export async function runDailyBroadcast(env, { force = false, notifyRussianStale = false, today = getBishkekDate() } = {}) {
+export async function runDailyBroadcast(env, { force = false, reportNotUpdated = true, today = getBishkekDate() } = {}) {
   const subscribers = await getActiveSubscribers(env);
   const recipients = includeOwner(subscribers, env);
   const summary = {
@@ -130,9 +141,6 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
     markMaterialError(summary.russian, cache.errors.russian);
   } else if (!cache.russian) {
     summary.russian.status = "not_updated";
-    if (notifyRussianStale) {
-      await sendMessage(env, env.OWNER_ID, "⌛ Дата Ежедневника ещё не изменилась. Проверю снова через час.");
-    }
   } else {
     Object.assign(summary.russian, await sendDailyToSubscribers(
       env,
@@ -177,7 +185,11 @@ export async function runDailyBroadcast(env, { force = false, notifyRussianStale
   }
 
   summary.deactivated = deactivatedChatIds.size;
-  await reportDailyProblems(env, today, { ...cache, sendFailures: deliveryProblems });
+  await reportDailyProblems(env, today, {
+    ...cache,
+    notUpdated: reportNotUpdated ? cache.notUpdated : {},
+    sendFailures: deliveryProblems
+  });
   return summary;
 }
 
@@ -349,9 +361,7 @@ export async function prepareDailyCache(
   if (requested.spiritual && !cache.spiritual) {
     tasks.push((async () => {
       try {
-        const principle = parseSpiritualPrinciple(
-          await fetchPage(SPIRITUAL_SOURCE_URL, { bypassCache: true })
-        );
+        const principle = parseSpiritualPrinciple(await fetchSpiritualHtml(today));
         if (!isCurrentEnglishDate(principle.date, today)) {
           notUpdated.spiritual = principle.date;
           console.log(JSON.stringify({
@@ -420,24 +430,6 @@ async function saveDailyCache(env, contentType, dateKey, sourceDate, payload) {
   `).bind(contentType, dateKey, sourceDate, JSON.stringify(payload)).run();
 }
 
-export async function processSpiritualDaily(env, html, today, subscribers) {
-  const spiritualPrinciple = parseSpiritualPrinciple(html);
-  if (!isCurrentEnglishDate(spiritualPrinciple.date, today)) return;
-
-  const pendingSubscribers = await getPendingSubscribers(env, "spiritual", today.key, subscribers);
-  if (!pendingSubscribers.length) return;
-
-  const translation = await translateToRussian(env, spiritualPrinciple.raw);
-  await sendDailyToSubscribers(
-    env,
-    "spiritual",
-    today.key,
-    "ДУХОВНЫЕ ПРИНЦИПЫ",
-    splitDailyText(translation),
-    pendingSubscribers
-  );
-}
-
 export function getBishkekDate(date = new Date()) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
     timeZone: BISHKEK_TIME_ZONE,
@@ -489,10 +481,9 @@ async function wasSent(env, key) {
   return Boolean(await env.DB.prepare("SELECT 1 FROM sent_reminders WHERE reminder_key = ?").bind(key).first());
 }
 
-async function getPendingSubscribers(env, contentType, dateKey, subscribers, deactivatedChatIds = new Set()) {
+async function getPendingSubscribers(env, contentType, dateKey, subscribers) {
   const pending = [];
   for (const chatId of subscribers) {
-    if (deactivatedChatIds.has(chatId)) continue;
     if (!await wasSent(env, `daily:${contentType}:${dateKey}:${chatId}`)) pending.push(chatId);
   }
   return pending;
@@ -562,18 +553,8 @@ function isInactiveRecipientError(error) {
 
 async function sendDailyPreviewFromCache(env, chatId, today) {
   const cache = await getDailyCache(env, today);
-  const missing = [];
-  if (cache.russian) {
-    await sendDailyPost(env, chatId, "ЕЖЕДНЕВНИК", cache.russian.payload);
-  } else {
-    missing.push("Ежедневник");
-  }
-  if (cache.spiritual) {
-    await sendDailyPost(env, chatId, "ДУХОВНЫЕ ПРИНЦИПЫ", cache.spiritual.payload);
-  } else {
-    missing.push("Духовные принципы");
-  }
-  return { missing };
+  if (cache.russian) await sendDailyPost(env, chatId, "ЕЖЕДНЕВНИК", cache.russian.payload);
+  if (cache.spiritual) await sendDailyPost(env, chatId, "ДУХОВНЫЕ ПРИНЦИПЫ", cache.spiritual.payload);
 }
 
 async function fetchPage(url, { bypassCache = false } = {}) {
@@ -583,6 +564,20 @@ async function fetchPage(url, { bypassCache = false } = {}) {
   });
   if (!response.ok) throw new Error(`Источник недоступен: ${url} (${response.status})`);
   return response.text();
+}
+
+async function fetchSpiritualHtml(today) {
+  const text = await fetchPage(spiritualSourceUrl(today), { bypassCache: true });
+  let reading = null;
+  try {
+    reading = JSON.parse(text);
+  } catch {
+    // handled below
+  }
+  if (typeof reading?.html !== "string") {
+    throw new Error("spad.na.org вернул ответ без текста Spiritual Principle");
+  }
+  return reading.html;
 }
 
 function parseRussianMeditation(html) {
@@ -690,16 +685,6 @@ async function sendDailyPost(env, chatId, heading, { date, title, body }) {
   }
 }
 
-async function sendMessage(env, chatId, text, options = {}) {
-  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, ...options })
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) throw new Error(`Telegram API: ${payload.description || response.status}`);
-}
-
 function splitMessage(text, limit) {
   const chunks = [];
   let remaining = text;
@@ -711,8 +696,4 @@ function splitMessage(text, limit) {
   }
   if (remaining) chunks.push(remaining);
   return chunks;
-}
-
-function escapeHtml(value) {
-  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[character]);
 }

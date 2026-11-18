@@ -14,10 +14,6 @@ const INSTRUCTIONS = [
 
 const PROVIDER_ORDER = ["workers-ai", "groq", "gemini"];
 
-export async function translateToRussian(env, text) {
-  return (await translateForDaily(env, text)).text;
-}
-
 export async function translateForDaily(env, text) {
   const failures = [];
   const skipped = [];

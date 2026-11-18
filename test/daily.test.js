@@ -13,12 +13,11 @@ import dailyWorker, {
   isCurrentEnglishDate,
   parseSpiritualPrinciple,
   prepareDailyCache,
-  processSpiritualDaily,
   runDailyBroadcast,
   sendDailyToSubscribers,
-  SPIRITUAL_SOURCE_URL
+  spiritualSourceUrl
 } from "../src/daily-gemini.js";
-import { currentSpadnaFixture, FakeDB, telegramFetch } from "./helpers.js";
+import { currentSpadnaFixture, FakeDB, isSpadnaRequest, spadnaResponse, telegramFetch } from "./helpers.js";
 
 const russianPreviewFixture = `
 <div class="text-lg font-bold">Тема дня</div>
@@ -67,7 +66,7 @@ function dailySourcesFetch(telegramMessages, failures = new Map()) {
   return async (url, options = {}) => {
     const target = String(url);
     if (target === "https://na-russia.org/") return new Response(russianPreviewFixture);
-    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
+    if (isSpadnaRequest(target)) return spadnaResponse();
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") {
       return new Response(JSON.stringify({
         steps: [{ type: "model_output", content: [{ type: "text", text: "8 сентября 2026\nПереведённая тема\nПереведённый текст" }] }]
@@ -95,7 +94,7 @@ function countedDailySourcesFetch(telegramMessages, sourceCalls) {
   const baseFetch = dailySourcesFetch(telegramMessages);
   return (url, options) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) {
+    if (target === "https://na-russia.org/" || isSpadnaRequest(target)) {
       sourceCalls.count += 1;
     }
     return baseFetch(url, options);
@@ -141,7 +140,7 @@ test("spiritual source is spad.na.org and bypasses cache without changing the Ru
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options = {}) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) {
+    if (target === "https://na-russia.org/" || isSpadnaRequest(target)) {
       sourceRequests.set(target, options);
     }
     return baseFetch(url, options);
@@ -152,11 +151,9 @@ test("spiritual source is spad.na.org and bypasses cache without changing the Ru
     { force: false, today: broadcastToday }
   );
 
-  assert.equal(SPIRITUAL_SOURCE_URL, "https://spad.na.org/");
-  const spiritualUrl = new URL(SPIRITUAL_SOURCE_URL);
-  assert.equal(`${spiritualUrl.origin}${spiritualUrl.pathname}`, "https://spad.na.org/");
-  assert.equal(spiritualUrl.search, "");
-  assert.equal(sourceRequests.get(SPIRITUAL_SOURCE_URL).cache, "no-store");
+  const spiritualUrl = "https://spad.na.org/wp-json/naws-spad/v1/reading?date=2026-09-08";
+  assert.equal(spiritualSourceUrl(broadcastToday), spiritualUrl);
+  assert.equal(sourceRequests.get(spiritualUrl).cache, "no-store");
   assert.equal("cache" in sourceRequests.get("https://na-russia.org/"), false);
 });
 
@@ -167,7 +164,7 @@ test("daily preparation translates once and reuses today's D1 cache", async (t) 
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) calls.sources += 1;
+    if (target === "https://na-russia.org/" || isSpadnaRequest(target)) calls.sources += 1;
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") calls.gemini += 1;
     return baseFetch(url, options);
   });
@@ -261,19 +258,6 @@ test("fan-out is per-user idempotent and one blocked recipient does not stop lat
   assert.equal(db.subscribers.get(3).active, 0);
 });
 
-test("stale Spiritual date sends no Telegram message", async (t) => {
-  const sent = [];
-  t.mock.method(globalThis, "fetch", telegramFetch(sent));
-  const stale = currentSpadnaFixture.replace("September 08, 2026", "September 07, 2026");
-  await processSpiritualDaily(
-    { DB: new FakeDB(), BOT_TOKEN: "test", GEMINI_API_KEY: "unused" },
-    stale,
-    { key: "2026-09-08", year: 2026, month: 9, day: 8, hour: 10 },
-    [1]
-  );
-  assert.deepEqual(sent, []);
-});
-
 for (const command of ["/daily_for_all", "/daily_force_all"]) {
   test(`${command} is unavailable to non-owner`, async (t) => {
     installTimingSafeEqual(t);
@@ -324,7 +308,7 @@ test("normal broadcast exits before fetch when every active subscriber has both 
   const calls = { sources: 0, gemini: 0, telegram: 0 };
   t.mock.method(globalThis, "fetch", async (url) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) calls.sources += 1;
+    if (target === "https://na-russia.org/" || isSpadnaRequest(target)) calls.sources += 1;
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") calls.gemini += 1;
     if (target.startsWith("https://api.telegram.org/bot")) calls.telegram += 1;
     throw new Error(`Unexpected fetch: ${target}`);
@@ -352,7 +336,7 @@ test("normal broadcast fetches and sends only Spiritual when Russian is complete
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) sources.push(target);
+    if (target === "https://na-russia.org/" || isSpadnaRequest(target)) sources.push(target);
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") geminiCalls += 1;
     return baseFetch(url, options);
   });
@@ -362,7 +346,7 @@ test("normal broadcast fetches and sends only Spiritual when Russian is complete
     { force: false, today: broadcastToday }
   );
 
-  assert.deepEqual(sources, [SPIRITUAL_SOURCE_URL]);
+  assert.deepEqual(sources, [spiritualSourceUrl(broadcastToday)]);
   assert.equal(geminiCalls, 1);
   assert.deepEqual(sent.map((message) => message.chat_id), [2]);
   assert.deepEqual(summary.russian, { status: "ready", sent: 0, skipped: 2, errors: 0 });
@@ -382,7 +366,7 @@ test("a new active subscriber without markers makes both materials pending again
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options) => {
     const target = String(url);
-    if (target === "https://na-russia.org/" || target === SPIRITUAL_SOURCE_URL) sources.push(target);
+    if (target === "https://na-russia.org/" || isSpadnaRequest(target)) sources.push(target);
     if (target === "https://generativelanguage.googleapis.com/v1beta/interactions") geminiCalls += 1;
     return baseFetch(url, options);
   });
@@ -397,7 +381,7 @@ test("a new active subscriber without markers makes both materials pending again
   db.subscribers.set(7, { chat_id: 7, active: 1 });
   const withNewSubscriber = await runDailyBroadcast(env, { force: false, today: broadcastToday });
 
-  assert.deepEqual(sources, ["https://na-russia.org/", SPIRITUAL_SOURCE_URL]);
+  assert.deepEqual(sources, ["https://na-russia.org/", spiritualSourceUrl(broadcastToday)]);
   assert.equal(geminiCalls, 1);
   assert.deepEqual(sent.map((message) => message.chat_id), [7, 7]);
   assert.equal(withNewSubscriber.russian.sent, 1);
@@ -414,8 +398,8 @@ test("stale Spiritual is reported without sending it and does not block current 
   t.mock.method(console, "log", (message) => logs.push(JSON.parse(message)));
   const baseFetch = dailySourcesFetch(sent);
   t.mock.method(globalThis, "fetch", (url, options) => {
-    if (String(url) === SPIRITUAL_SOURCE_URL) {
-      return Promise.resolve(new Response(currentSpadnaFixture.replace("September 08, 2026", "September 07, 2026")));
+    if (isSpadnaRequest(url)) {
+      return Promise.resolve(spadnaResponse(currentSpadnaFixture.replace("September 08, 2026", "September 07, 2026")));
     }
     return baseFetch(url, options);
   });
@@ -612,13 +596,60 @@ test("summary shows FORCE mode and material counters", () => {
 
 test("Daily Cron handler remains explicitly configured for silent normal mode", async () => {
   const source = await readFile(new URL("../src/daily-gemini.js", import.meta.url), "utf8");
-  assert.match(source, /runDailyBroadcast\(env, \{ force: false, today \}\)/);
-  assert.doesNotMatch(source, /checkScheduledDaily[\s\S]*?notifyRussianStale: true/);
+  assert.match(source, /runDailyBroadcast\(env, \{ force: false, today, reportNotUpdated: isLastCheck \}\)/);
   assert.doesNotMatch(source, /checkScheduledDaily[\s\S]*?force: true/);
   assert.equal(getBishkekDate(new Date("2026-09-08T03:00:00Z")).hour, 9);
 });
 
-test("scheduled stale Russian source tells the owner once and still sends the owner any missing material", async (t) => {
+test("09:00 check with yesterday's Spiritual date sends Russian, waits and reports nothing", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  let spiritualDate = "September 07, 2026";
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    if (isSpadnaRequest(url)) {
+      return Promise.resolve(spadnaResponse(currentSpadnaFixture.replace("September 08, 2026", spiritualDate)));
+    }
+    return baseFetch(url, options);
+  });
+  t.mock.method(console, "log", () => {});
+  const env = { DB: db, BOT_TOKEN: "test", OWNER_ID: "77", GEMINI_API_KEY: "test" };
+
+  await checkScheduledDaily(env, { ...broadcastToday, hour: 9, minute: 0 });
+  assert.deepEqual(sent.map((message) => String(message.chat_id)), ["1", "77"]);
+  assert.ok(sent.every((message) => message.text.includes("ЕЖЕДНЕВНИК")));
+
+  spiritualDate = "September 08, 2026";
+  await checkScheduledDaily(env, { ...broadcastToday, hour: 9, minute: 15 });
+
+  assert.equal(sent.filter((message) => message.text.includes("ДУХОВНЫЕ ПРИНЦИПЫ")).length, 2);
+  assert.equal(sent.filter((message) => message.text.includes("Отчёт")).length, 0);
+});
+
+test("a real source error at 09:00 is reported to the owner right away", async (t) => {
+  const db = new FakeDB();
+  db.subscribers.set(1, { chat_id: 1, active: 1 });
+  const sent = [];
+  const baseFetch = dailySourcesFetch(sent);
+  t.mock.method(globalThis, "fetch", (url, options) => {
+    if (isSpadnaRequest(url)) return Promise.resolve(new Response("unavailable", { status: 503 }));
+    return baseFetch(url, options);
+  });
+
+  await checkScheduledDaily(
+    { DB: db, BOT_TOKEN: "test", OWNER_ID: "77", GEMINI_API_KEY: "test" },
+    { ...broadcastToday, hour: 9, minute: 0 }
+  );
+
+  const reports = sent.filter((message) => message.text.includes("Отчёт"));
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].chat_id, "77");
+  assert.match(reports[0].text, /Духовные принципы не подготовлены/);
+  assert.match(reports[0].text, /503/);
+});
+
+test("scheduled stale Russian source is reported to the owner once, only at the 14:00 check", async (t) => {
   const db = new FakeDB();
   db.subscribers.set(1, { chat_id: 1, active: 1 });
   db.markers.add("daily:spiritual:2026-09-08:1");
@@ -631,9 +662,9 @@ test("scheduled stale Russian source tells the owner once and still sends the ow
       sourceRequests.push(target);
       return new Response(russianPreviewFixture.replace("8 сентября", "7 сентября"));
     }
-    if (target === SPIRITUAL_SOURCE_URL) {
+    if (isSpadnaRequest(target)) {
       sourceRequests.push(target);
-      return new Response(currentSpadnaFixture);
+      return spadnaResponse();
     }
     if (target.startsWith("https://api.telegram.org/bot")) {
       telegramMessages.push(JSON.parse(options.body));
@@ -647,8 +678,12 @@ test("scheduled stale Russian source tells the owner once and still sends the ow
 
   await checkScheduledDaily(env, { ...broadcastToday, minute: 15 });
   await checkScheduledDaily(env, { ...broadcastToday, minute: 30 });
+  assert.equal(telegramMessages.length, 0, "an old date before 14:00 is not a problem yet");
 
-  assert.deepEqual(sourceRequests, ["https://na-russia.org/", "https://na-russia.org/"]);
+  await checkScheduledDaily(env, { ...broadcastToday, hour: 14, minute: 0 });
+  await checkScheduledDaily(env, { ...broadcastToday, hour: 14, minute: 0 });
+
+  assert.deepEqual(sourceRequests, Array(4).fill("https://na-russia.org/"));
   assert.equal(telegramMessages.length, 1);
   assert.equal(telegramMessages[0].chat_id, "77");
   assert.match(telegramMessages[0].text, /Ежедневник не отправлен/);
@@ -664,7 +699,7 @@ test("a broken translator is reported to the owner once, with the place in the c
   const sent = [];
   t.mock.method(globalThis, "fetch", async (url, options = {}) => {
     const target = String(url);
-    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
+    if (isSpadnaRequest(target)) return spadnaResponse();
     if (target === "https://api.groq.com/openai/v1/chat/completions") {
       return new Response(JSON.stringify({ error: { message: "rate limit" } }), {
         status: 429,
@@ -796,11 +831,14 @@ test("/daily sends today's cached materials without source or model calls", asyn
   const backgroundTasks = [];
   const previewDb = new FakeDB();
   const today = getBishkekDate();
+  const russianMonths = ["января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+  const russianDate = `${today.day} ${russianMonths[today.month - 1]}`;
   previewDb.dailyCache.set(`russian:${today.key}`, {
     content_type: "russian",
     date_key: today.key,
-    source_date: `${today.day} сентября`,
-    payload: JSON.stringify({ date: `${today.day} сентября`, title: "Тема", body: "Ежедневник" })
+    source_date: russianDate,
+    payload: JSON.stringify({ date: russianDate, title: "Тема", body: "Ежедневник" })
   });
   const englishDate = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Bishkek",

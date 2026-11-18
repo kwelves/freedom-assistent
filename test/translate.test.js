@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { prepareDailyCache, SPIRITUAL_SOURCE_URL } from "../src/daily-gemini.js";
+import { prepareDailyCache } from "../src/daily-gemini.js";
 import {
   GEMINI_MODELS,
   GROQ_MODEL,
-  translateToRussian,
+  translateForDaily,
   WORKERS_AI_MODEL
 } from "../src/translate.js";
-import { currentSpadnaFixture, FakeDB } from "./helpers.js";
+import { currentSpadnaFixture, FakeDB, isSpadnaRequest, spadnaResponse } from "./helpers.js";
 
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -39,7 +39,7 @@ test("Workers AI is used first and the other translators stay idle", async (t) =
     throw new Error(`fetch must stay idle: ${url}`);
   });
 
-  const translation = await translateToRussian({
+  const { text: translation } = await translateForDaily({
     AI: {
       async run(model, input, options) {
         calls.push({ model, options, text: input.messages.at(-1).content });
@@ -74,7 +74,7 @@ test("a busy Workers AI falls through Groq, then both Gemini models", async (t) 
     throw new Error(`Unexpected fetch: ${target}`);
   });
 
-  const translation = await translateToRussian({
+  const { text: translation } = await translateForDaily({
     AI: { async run() { throw new Error("busy"); } },
     GROQ_API_KEY: "groq",
     GEMINI_API_KEY: "gemini"
@@ -98,7 +98,7 @@ test("Groq is skipped when its key is absent and Gemini still translates", async
     return jsonResponse(geminiPayload("Перевод Gemini"));
   });
 
-  const translation = await translateToRussian({ GEMINI_API_KEY: "gemini" }, "Hello");
+  const { text: translation } = await translateForDaily({ GEMINI_API_KEY: "gemini" }, "Hello");
 
   assert.equal(translation, "Перевод Gemini");
   assert.deepEqual(models, [GEMINI_MODELS[0]]);
@@ -110,7 +110,7 @@ test("an empty Workers AI answer falls through to the next translator", async (t
     return jsonResponse({ choices: [{ message: { content: "Перевод Groq" } }] });
   });
 
-  const translation = await translateToRussian({
+  const { text: translation } = await translateForDaily({
     AI: { async run() { return { choices: [{ message: { content: "  " } }] }; } },
     GROQ_API_KEY: "groq"
   }, "Hello");
@@ -120,7 +120,7 @@ test("an empty Workers AI answer falls through to the next translator", async (t
 
 test("translation explains that no translator is configured", async () => {
   await assert.rejects(
-    () => translateToRussian({}, "Hello"),
+    () => translateForDaily({}, "Hello"),
     /Не настроен ни один API перевода/
   );
 });
@@ -128,7 +128,7 @@ test("translation explains that no translator is configured", async () => {
 test("translation explains when every configured translator fails", async (t) => {
   t.mock.method(globalThis, "fetch", async () => jsonResponse({ error: { message: "quota" } }, 429));
   await assert.rejects(
-    () => translateToRussian({ GEMINI_API_KEY: "gemini" }, "Hello"),
+    () => translateForDaily({ GEMINI_API_KEY: "gemini" }, "Hello"),
     /Перевод недоступен/
   );
 });
@@ -139,7 +139,7 @@ test("daily cache stores one Workers AI translation and reuses it", async (t) =>
   t.mock.method(globalThis, "fetch", async (url) => {
     const target = String(url);
     if (target === "https://na-russia.org/") return new Response(russianFixture);
-    if (target === SPIRITUAL_SOURCE_URL) return new Response(currentSpadnaFixture);
+    if (isSpadnaRequest(target)) return spadnaResponse(currentSpadnaFixture);
     throw new Error(`Unexpected fetch: ${target}`);
   });
   const env = {

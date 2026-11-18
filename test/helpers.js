@@ -1,3 +1,5 @@
+import { SPIRITUAL_SOURCE_URL } from "../src/daily-gemini.js";
+
 export class FakeDB {
   constructor() {
     this.subscribers = new Map();
@@ -101,6 +103,17 @@ export function telegramFetch(sent, failures = new Map()) {
       headers: { "content-type": "application/json" }
     });
   };
+}
+
+export function isSpadnaRequest(url) {
+  return String(url).startsWith(SPIRITUAL_SOURCE_URL);
+}
+
+// The spad.na.org reading endpoint wraps the same table HTML in JSON.
+export function spadnaResponse(html = currentSpadnaFixture) {
+  return new Response(JSON.stringify({ date: "2026-09-08", html }), {
+    headers: { "content-type": "application/json" }
+  });
 }
 
 export const currentSpadnaFixture = `
