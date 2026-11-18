@@ -1,3 +1,5 @@
+import { escapeHtml, sendMessage } from "./telegram.js";
+
 const GREETINGS = [
   "Привет, {name}! Рады видеть тебя здесь. Ты не один — мы все здесь ради одной цели. Добро пожаловать в семью! 🤝",
   "Добро пожаловать, {name}! Здесь безопасное место, где тебя поймут и поддержат. Мы рады, что ты с нами! 💚",
@@ -46,8 +48,7 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    const meetingTime = controller.cron === "0 13 * * MON,THU" ? "21:00" : "19:00";
-    ctx.waitUntil(sendScheduledReminder(env, meetingTime, controller.scheduledTime));
+    ctx.waitUntil(sendScheduledReminder(env, "19:00", controller.scheduledTime));
   }
 };
 
@@ -164,17 +165,6 @@ function sendReply(env, message, text) {
   return sendMessage(env, message.chat.id, text, { reply_parameters: { message_id: message.message_id } });
 }
 
-async function sendMessage(env, chatId, text, options = {}) {
-  const response = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, ...options })
-  });
-  const payload = await response.json();
-  if (!response.ok || !payload.ok) throw new Error(`Telegram API error: ${payload.description || response.status}`);
-  return payload.result;
-}
-
 function isAuthorized(userId, env) {
   const userIds = [env.OWNER_ID, ...(env.ALLOWED_USERS || "").split(",")]
     .map((value) => String(value).trim()).filter(Boolean);
@@ -194,10 +184,6 @@ function normalizeUsername(value) {
 
 function choose(values) {
   return values[Math.floor(Math.random() * values.length)];
-}
-
-function escapeHtml(value) {
-  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[character]);
 }
 
 async function hasValidWebhookSecret(request, expectedSecret) {

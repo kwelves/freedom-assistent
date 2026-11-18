@@ -1,8 +1,11 @@
+import { SPIRITUAL_SOURCE_URL } from "../src/daily-gemini.js";
+
 export class FakeDB {
   constructor() {
     this.subscribers = new Map();
     this.markers = new Set();
     this.usernames = new Set();
+    this.dailyCache = new Map();
   }
 
   prepare(sql) {
@@ -21,6 +24,13 @@ export class FakeDB {
         return null;
       },
       async all() {
+        if (normalized.startsWith("SELECT content_type, source_date, payload FROM daily_cache")) {
+          return {
+            results: [...db.dailyCache.values()]
+              .filter((row) => row.date_key === values[0])
+              .map(({ content_type, source_date, payload }) => ({ content_type, source_date, payload }))
+          };
+        }
         if (normalized.startsWith("SELECT chat_id FROM subscribers")) {
           return { results: [...db.subscribers.values()].filter((row) => row.active === 1).map(({ chat_id }) => ({ chat_id })) };
         }
@@ -30,6 +40,16 @@ export class FakeDB {
         return { results: [] };
       },
       async run() {
+        if (normalized.startsWith("INSERT INTO daily_cache")) {
+          const [content_type, date_key, source_date, payload] = values;
+          db.dailyCache.set(`${content_type}:${date_key}`, {
+            content_type,
+            date_key,
+            source_date,
+            payload
+          });
+          return { meta: { changes: 1 } };
+        }
         if (normalized.startsWith("INSERT INTO subscribers")) {
           const [chat_id, username, first_name, created_at] = values;
           const previous = db.subscribers.get(chat_id);
@@ -83,6 +103,17 @@ export function telegramFetch(sent, failures = new Map()) {
       headers: { "content-type": "application/json" }
     });
   };
+}
+
+export function isSpadnaRequest(url) {
+  return String(url).startsWith(SPIRITUAL_SOURCE_URL);
+}
+
+// The spad.na.org reading endpoint wraps the same table HTML in JSON.
+export function spadnaResponse(html = currentSpadnaFixture) {
+  return new Response(JSON.stringify({ date: "2026-09-08", html }), {
+    headers: { "content-type": "application/json" }
+  });
 }
 
 export const currentSpadnaFixture = `
